@@ -184,7 +184,14 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
     let c = Container::parse(container).map_err(|e| e.to_string())?;
-    let programs = match c.part(FourCC::DXIL) {
+    // Keep this experimental path explicit until all upscaler passes run correctly together.
+    if c.part(FourCC::DXIL).is_none()
+        && c.part(FourCC::ACCC).is_some()
+        && std::env::var_os("VICTORY_FSPX").is_none_or(|v| v != "1")
+    {
+        return Err("ACCC/FSPX compute translation needs VICTORY_FSPX=1".into());
+    }
+    let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };

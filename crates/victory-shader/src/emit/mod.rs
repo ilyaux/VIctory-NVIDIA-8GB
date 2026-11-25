@@ -319,6 +319,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
     let native = crate::native_programs(dxil.data)?
         .into_iter()
@@ -832,6 +833,27 @@ mod tests {
     use super::shader::Shader;
     use super::*;
     use crate::native::{ComputeIo, StageIo};
+
+    #[test]
+    fn an_accc_compute_container_translates_to_valid_dxil() {
+        let program = crate::native::tests::fspx(
+            &0xBF81_0000u32.to_le_bytes(), // s_endpgm
+            0x9c,
+            [8, 4, 1],
+            true,
+            &[],
+        );
+        let input = crate::dxbc::build(&[(FourCC::ACCC, &program)]);
+        let out = translate(&input).expect("ACCC compute program must reach the emitter");
+        assert_eq!(out.stage, HwStage::Cs);
+        let container = Container::parse(&out.dxil).unwrap();
+        assert!(container.part(FourCC::DXIL).is_some());
+        #[cfg(windows)]
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            v.validate(&mut out.dxil.clone()).expect("ACCC output failed DXIL validation");
+            eprintln!("ACCC output validated by dxil.dll");
+        }
+    }
 
     /// A pixel shader writing SV_StencilRef (channel y of `exp mrtz`).
     /// DXC sets ShaderFlags.StencilRef (bit 11) for a pixel shader whose

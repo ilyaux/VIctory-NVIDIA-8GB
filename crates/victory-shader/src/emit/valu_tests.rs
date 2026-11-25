@@ -15,6 +15,114 @@ use crate::{io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+const fn dot4(vdst: u8, src0: u16, src1: u16, src2: u16, opsel: u32, opsel_hi: u32) -> [u32; 2] {
+    [
+        0xCC16_0000 | (opsel_hi >> 2 & 1) << 14 | (opsel & 7) << 11 | vdst as u32,
+        (opsel_hi & 3) << 27
+            | (src2 as u32 & 0x1FF) << 18
+            | (src1 as u32 & 0x1FF) << 9
+            | (src0 as u32 & 0x1FF),
+    ]
+}
+
+fn fspx_cs(body: &[u32]) -> HostShader {
+    use crate::native::tests::{fspx, fspx_resource};
+    let mut words = vec![s_mov_b32(5, 0x80)];
+    words.extend_from_slice(&s_load_dwordx4(8, 4));
+    words.extend_from_slice(body);
+    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
+    words.push(S_ENDPGM);
+    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let part = fspx(
+        &code,
+        5 << 1,
+        [1, 1, 1],
+        true,
+        &[fspx_resource(3, 3, 0, 0, 4, 1)],
+    );
+    let container = crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]);
+    super::translate(&container).expect("translate")
+}
+
+fn dot4_ref(a: u32, b: u32, acc: u32) -> u32 {
+    (0..4).fold(acc, |s, k| {
+        let (x, y) = ((a >> (8 * k)) as i8 as i32, (b >> (8 * k)) as i8 as i32);
+        s.wrapping_add((x * y) as u32)
+    })
+}
+
+#[test]
+fn fspx_programs_run_with_the_hardwares_dot_products() {
+    let (a, b, acc) = (0x0302_FB02u32, 0x80FF_7F01u32, 0x7FFF_FFF0u32);
+    let mut load = Vec::new();
+    for (v, x) in [(1, a), (2, b), (3, acc)] {
+        load.extend([vop1(0x001, v, 0xFF), x]); // v_mov_b32 vN, literal
+    }
+    let cases: [(Vec<u32>, u32); 4] = [
+        (
+            dot4(0, vgpr(1), vgpr(2), vgpr(3), 0, 7).to_vec(),
+            dot4_ref(a, b, acc),
+        ),
+        // sel_hi_lo on an inline 2.0 (0x40000000): the halves swapped.
+        (
+            dot4(0, vgpr(1), 244, vgpr(3), 0b010, 0b101).to_vec(),
+            dot4_ref(a, 0x4000, acc),
+        ),
+        (
+            dot4(0, vgpr(1), vgpr(2), vgpr(3), 0b001, 0b110).to_vec(),
+            dot4_ref(a.rotate_left(16), b, acc),
+        ),
+        // v_mov_b32 v0, v3; v_dot4c_i32_i8 v0, v1, v2
+        (
+            vec![
+                vop1(0x001, 0, vgpr(3)),
+                0x0d << 25 | 2 << 9 | vgpr(1) as u32,
+            ],
+            dot4_ref(a, b, acc),
+        ),
+    ];
+    for (body, want) in cases {
+        let mut words = load.clone();
+        words.extend(&body);
+        let shader = fspx_cs(&words);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: {body:08x?}");
+        });
+    }
+}
+
+#[test]
+fn packed_fmac_accumulates_each_half() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 0, vgpr(3)),              // v_mov_b32 v0, v3
+        0x3C << 25 | 2 << 9 | vgpr(1) as u32, // v_pk_fmac_f16 v0, v1, v2
+    ]);
+    // (2.0, 1.0) * (3.0, 4.0) + (1.0, 0.5) = (7.0, 4.5)
+    run_cases(
+        &shader,
+        &[[0x4000_3C00, 0x4200_4400, 0x3C00_3800, 0]],
+        |backend, _, _, got| {
+            assert_eq!(got, 0x4700_4480, "{backend}");
+        },
+    );
+}
+
+#[test]
+fn src_scc_reads_as_zero_or_one() {
+    for (compare, want) in [(0xBF06_8181u32, 1), (0xBF06_8281, 0)] {
+        // Compare 1 with 1 (or 2), then read SCC through scalar and vector moves.
+        let shader = build_valu_cs(&[
+            compare,
+            s_mov_b32(12, 253),
+            vop1(0x001, 0, sgpr(12)),
+            0x25 << 25 | u32::from(vgpr(0) as u8) << 9 | 253,
+        ]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, 2 * want, "{backend}");
+        });
+    }
+}
+
 /// SOP1 `s_mov_b32 sdst, src0`.
 const fn s_mov_b32(sdst: u8, src0: u8) -> u32 {
     0xBE80_0000 | (sdst as u32) << 16 | 0x03 << 8 | src0 as u32

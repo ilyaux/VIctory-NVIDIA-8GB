@@ -47,3 +47,48 @@ set. A warm control run and comparable scenes are required.
    and scene transitions.
 
 No stable 30 FPS gameplay result has been established.
+
+## Warm runs and the Series S upscaler
+
+The warm Series X run loaded 1662 cached pipelines in about seven seconds.
+Intro scenes reached 4.6-6.8 FPS with no pipelines pending, but a later courtyard
+scene fell to around 0.3 FPS with 4906-7704 draws per frame. The reported memory
+use exceeded the 7123 MiB DXGI budget (7265-7361 MiB in use, plus substantial
+shared memory). Cold compilation therefore does not explain the whole problem.
+
+Series S reduced reported GPU memory use to about 4780 MiB. With the diagnostic
+sampler and DRED removed, some later scenes reached 7-8 FPS. These are different
+scenes, not a controlled speedup measurement, and the picture was invalid:
+20 compute shaders failed to translate. This result is not successful gameplay.
+
+### Experimental ACCC/FSPX support
+
+Branch `perf/fspx-upscaler` backports selected translator work from
+[Marvisak/VIctory commit 0b35b7f](https://github.com/Marvisak/VIctory/commit/0b35b7fe7d728c9a9c205cb3719a0f11744321ce),
+authored by Marvis, with original co-author Claude Fable 5.2. It includes the
+FSPX compute metadata parser, raw-descriptor tracing, signed packed dot products,
+packed half-precision multiply-accumulate, SCC operands and constant sampler
+words. The runtime path requires `VICTORY_FSPX=1`; it remains disabled by default.
+
+The added regression fixtures are synthetic. They cover malformed metadata,
+resource bounds, ACCC-to-DXIL translation and arithmetic on the hardware GPU and
+WARP. Windows SDK `dxil.dll` validated the synthetic ACCC output. The final
+full shader suite passed 224 tests, with three ignored. The diagnostics build
+and repository asset-policy check also passed.
+
+An offline scan of the locally supplied upscaler DLL found 29 compute programs.
+All 29 now parse, structure and track resources; 23 emit DXIL and pass validation.
+Six still stop at unsupported lane-mask, half-precision image-atomic or root-
+descriptor operations. An offline CLI exit code of zero does not mean that
+every program translated: inspect its emitted and validated counts.
+
+The native Series S probe requested 20 ACCC programs. Matching their complete
+ACCC payloads against the supplied DLL identified all 20; 15 translated and
+five remained unsupported (four lane-mask cases and one half-precision image
+atomic). No host pipeline refusal named those ACCC shaders. This establishes
+translation coverage, not correct execution of the complete upscaler. The
+picture remained invalid and this run is not an FPS improvement result.
+
+Complete picture, controls and comparable frame times remain to be checked.
+No game binaries, shader dumps, screenshots, saves or raw logs are included in
+this repo.
