@@ -721,6 +721,12 @@ fn create() -> windows::core::Result<Host> {
         let adapter = CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|factory| factory.EnumAdapterByLuid::<IDXGIAdapter3>(device.GetAdapterLuid()))
             .ok();
+        if let Some(desc) = adapter.as_ref().and_then(|adapter| adapter.GetDesc1().ok()) {
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            tracing::info!(adapter = %name, vendor = desc.VendorId, device = desc.DeviceId,
+                dedicated_mb = desc.DedicatedVideoMemory >> 20, "host D3D12 adapter");
+        }
         tracing::info!("host D3D12 device ready");
         Ok(Host {
             device,
