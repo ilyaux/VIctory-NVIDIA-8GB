@@ -10,9 +10,12 @@ logs and saves outside this repository. See [the asset policy](docs/asset-policy
 
 ## Current status (2026-11-26)
 
-The game has not been run on this machine through this fork yet. There are no
-RTX 5070 gameplay, FPS or whole-process VRAM results. The available GPU
-regressions were run on WARP, the software adapter.
+Native runs have started on this machine. Startup/menu runs at approximately
+30 FPS; the first intro runs fell to roughly 0.3-3 FPS with pipelines still
+compiling. The initial baseline also ended with GPU device removal
+`0x887A0006`. Stable 30 FPS gameplay has not been established. See the
+[performance investigation](docs/performance-rtx5070.md) for evidence and limits.
+The automated GPU regressions below were run on WARP, the software adapter.
 
 | Target machine | Verified hardware |
 | --- | --- |
@@ -76,7 +79,7 @@ cargo build --locked --profile diag -p victory --features diagnostics
 
 ## First hardware comparisons
 
-Once the game files are ready, confirm that the D3D12 device is the RTX 5070.
+For each run, confirm that the logged D3D12 device is the RTX 5070.
 Start with the existing adaptive memory budgeting; an explicit
 `VICTORY_TEXTURE_BUDGET_MB` limits texture-copy accounting and does not cap total
 VRAM use. No fixed 8 GB tuning preset has been established yet.
