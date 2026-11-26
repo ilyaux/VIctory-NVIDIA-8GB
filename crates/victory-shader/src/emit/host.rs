@@ -1,7 +1,7 @@
 //! Host D3D12 checks for emitted shaders: pipeline creation and, for
 //! tests, drawing a full-screen triangle and reading the target back.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -62,10 +62,133 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
+fn requested_adapter_name(warp: bool, value: Option<OsString>) -> Result<Option<String>, String> {
+    if warp {
+        return Ok(None);
+    }
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let name = value
+        .into_string()
+        .map_err(|_| "VICTORY_D3D12_ADAPTER is not valid Unicode".to_owned())?;
+    if name.trim().is_empty() {
+        return Err("VICTORY_D3D12_ADAPTER is empty".to_owned());
+    }
+    Ok(Some(name))
+}
+
+/// Exact hardware names only. Inspect all candidates before returning one:
+/// a second matching hardware adapter makes the request ambiguous.
+fn select_named_adapter<T>(
+    wanted: &str,
+    adapters: impl IntoIterator<Item = (String, bool, T)>,
+) -> Result<T, String> {
+    if wanted.trim().is_empty() {
+        return Err("VICTORY_D3D12_ADAPTER is empty".to_owned());
+    }
+    let mut found = None;
+    for (name, software, adapter) in adapters {
+        if !software && name == wanted {
+            if found.is_some() {
+                return Err(format!("the requested D3D12 adapter name is ambiguous: {wanted:?}"));
+            }
+            found = Some(adapter);
+        }
+    }
+    found.ok_or_else(|| format!("no hardware D3D12 adapter named {wanted:?}"))
+}
+
+#[cfg(test)]
+mod adapter_selection_tests {
+    use super::{Host, CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIFactory4, IDXGIAdapter1};
+    use super::{requested_adapter_name, select_named_adapter};
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    fn adapters(values: &[(&str, bool, u32)]) -> Vec<(String, bool, u32)> {
+        values.iter().map(|&(name, software, id)| (name.to_owned(), software, id)).collect()
+    }
+
+    #[test]
+    fn explicit_warp_precedes_even_an_invalid_name() {
+        for name in [OsString::new(), OsString::from_wide(&[0xd800])] {
+            assert_eq!(requested_adapter_name(true, Some(name)), Ok(None));
+        }
+    }
+
+    #[test]
+    fn explicit_names_fail_closed_but_unset_preserves_default() {
+        assert_eq!(requested_adapter_name(false, None), Ok(None));
+        for name in [OsString::new(), OsString::from(" \t"), OsString::from_wide(&[0xd800])] {
+            assert!(requested_adapter_name(false, Some(name)).is_err());
+        }
+        assert_eq!(
+            requested_adapter_name(false, Some(OsString::from(" Test GPU "))),
+            Ok(Some(" Test GPU ".to_owned())),
+        );
+    }
+
+    #[test]
+    fn hardware_name_is_complete_and_case_sensitive() {
+        let values = [("Other GPU", false, 1), ("Test GPU", false, 2)];
+        assert_eq!(select_named_adapter("Test GPU", adapters(&values)), Ok(2));
+        for name in ["Test", "GPU", "test GPU", "Test GPU ", " Test GPU", "Missing GPU", ""] {
+            assert!(select_named_adapter(name, adapters(&values)).is_err());
+        }
+        assert!(select_named_adapter("Test GPU", Vec::<(String, bool, u32)>::new()).is_err());
+    }
+
+    #[test]
+    fn a_software_match_does_not_replace_or_ambiguate_hardware() {
+        assert_eq!(
+            select_named_adapter("Test GPU", adapters(&[("Test GPU", true, 1), ("Test GPU", false, 2)])),
+            Ok(2),
+        );
+        assert!(select_named_adapter(
+            "Test GPU",
+            adapters(&[("Test GPU", true, 1), ("Other GPU", false, 2)]),
+        ).is_err());
+    }
+
+    #[test]
+    fn duplicate_hardware_names_are_ambiguous() {
+        assert!(select_named_adapter(
+            "Test GPU",
+            adapters(&[("Test GPU", false, 1), ("Other GPU", false, 2), ("Test GPU", false, 3)]),
+        ).is_err());
+    }
+
+    #[test]
+    #[ignore = "explicit VICTORY_D3D12_ADAPTER; creates only a device, no commands"]
+    fn named_device_matches_the_requested_hardware() {
+        let name = std::env::var("VICTORY_D3D12_ADAPTER").expect("explicit hardware name required");
+        assert!(!name.trim().is_empty());
+        assert!(!std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1"));
+        let host = Host::new(false).expect("named device");
+        // SAFETY: metadata queries on the device just created; no queues or
+        // command lists are created and no shader is dispatched.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let luid = host.device.GetAdapterLuid();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(luid).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            assert_eq!(String::from_utf16(&desc.Description[..end]).unwrap(), name);
+            assert_eq!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            host.device.GetDeviceRemovedReason().unwrap();
+            println!("named device: {name}, LUID {:08x}:{:08x}, no commands submitted", luid.HighPart as u32, luid.LowPart);
+        }
+    }
+}
+
 impl Host {
-    /// The default adapter, or WARP with `warp` (or `VICTORY_WARP=1`).
+    /// WARP with `warp` (or `VICTORY_WARP=1`), otherwise the exact hardware
+    /// name in `VICTORY_D3D12_ADAPTER`, or the default adapter when unset.
+    /// A failed explicit name never falls back to another adapter.
     pub fn new(warp: bool) -> Result<Self, String> {
         let warp = warp || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1");
+        let wanted = requested_adapter_name(warp, std::env::var_os("VICTORY_D3D12_ADAPTER"))?;
         // SAFETY: plain D3D12/DXGI calls with valid out pointers.
         unsafe {
             // `VICTORY_D3D12_DEBUG`: the debug layer, whose messages a
@@ -79,11 +202,33 @@ impl Host {
                 }
             }
             let mut device: Option<ID3D12Device> = None;
+            let mut selected_luid = None;
             if warp {
                 let factory: IDXGIFactory4 =
                     CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
                 let adapter: IDXGIAdapter = factory.EnumWarpAdapter().map_err(err)?;
                 D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+            } else if let Some(wanted) = wanted.as_deref() {
+                let factory: IDXGIFactory4 =
+                    CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(err)?;
+                let mut adapters = Vec::new();
+                for index in 0.. {
+                    let adapter = match factory.EnumAdapters1(index) {
+                        Ok(adapter) => adapter,
+                        Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                        Err(e) => return Err(err(e)),
+                    };
+                    let desc = adapter.GetDesc1().map_err(err)?;
+                    let end = desc.Description.iter().position(|&c| c == 0)
+                        .unwrap_or(desc.Description.len());
+                    let name = String::from_utf16(&desc.Description[..end])
+                        .map_err(|_| "a DXGI adapter name is not valid Unicode".to_owned())?;
+                    let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+                    adapters.push((name, software, (adapter, desc.AdapterLuid)));
+                }
+                let (adapter, luid) = select_named_adapter(wanted, adapters)?;
+                D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
+                selected_luid = Some(luid);
             } else {
                 D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).map_err(err)?;
                 // A machine without a graphics card gives the software
@@ -103,6 +248,16 @@ impl Host {
                 }
             }
             let device = device.ok_or("no device")?;
+            if let Some(expected) = selected_luid {
+                let actual = device.GetAdapterLuid();
+                if actual.LowPart != expected.LowPart || actual.HighPart != expected.HighPart {
+                    return Err(format!(
+                        "D3D12 device LUID {:08x}:{:08x} does not match the selected adapter {:08x}:{:08x}",
+                        actual.HighPart as u32, actual.LowPart,
+                        expected.HighPart as u32, expected.LowPart,
+                    ));
+                }
+            }
             let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
                 HighestShaderModel: D3D_SHADER_MODEL_6_6,
             };
