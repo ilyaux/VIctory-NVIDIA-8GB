@@ -2888,7 +2888,32 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
-                once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                // Lookup only: a missing resource may not have been used
+                // yet; a matching key does not prove shared image contents.
+                once!(
+                    dimension = resource[0],
+                    layers_levels = format_args!("{:#x}", resource[7]),
+                    format = resource[8],
+                    flags = format_args!("{:#x}", resource[12]),
+                    view_format = desc[0],
+                    view_dimension = desc[1],
+                    address = format_args!("{:#x}", u64::from(desc[10]) | u64::from(desc[11]) << 32),
+                    known_resource_same_words = crate::resource::placed_known(
+                        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                        resource
+                    )
+                    .is_some(),
+                    known_resource_without_unordered = crate::resource::placed_known(
+                        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                        &{
+                            let mut words = *resource;
+                            words[12] &= !4;
+                            words
+                        }
+                    )
+                    .is_some(),
+                    "placed unordered texture view not mirrored"
+                );
                 return None;
             }
             // The resource description's width, after the alignment.
