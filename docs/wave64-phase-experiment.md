@@ -126,5 +126,10 @@ loop completion/collective loop-limit return;128 cover mask counts, first-set-bi
 prefixes and atomic-return broadcast in64x1 and8x8 groups. The latter include an
 upper-half-only EXEC set, a saved mask consumed after EXEC changes, its complement
 and a joined mask. Opaque/fixed masks and multiple-source-wave groups still refuse.
-These checks do not establish the performance or rendering of the extended
-candidate in the game.
+The extended build then created and bound that second compute pipeline in the
+game, and completed90.12 seconds of qualified 3D without a logged device error.
+Complete warm windows produced173 frames in72.5 seconds (2.39 FPS), with a266 ms
+median and1255 ms p95. The captured cutscene still has black faces. Different
+cache and scene state prevent an isolated comparison with the previous trial.
+This extends bounded compatibility evidence; it does not establish correct,
+controllable gameplay or a frame-rate improvement.
