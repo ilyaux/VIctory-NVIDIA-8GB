@@ -31,6 +31,9 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
+mod diagnostics;
+use diagnostics::{Origin, measured};
+use victory_gpu::framelog::{self, T};
 
 const MIB: usize = 1 << 20;
 
@@ -394,7 +397,7 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 });
 
 fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+    measured(T::PhysicalLockUs, || PHYSICAL.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -668,6 +671,10 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    map_physical(address, n, pages, Origin::Direct)
+}
+
+fn map_physical(address: *mut c_void, n: usize, pages: *const usize, origin: Origin) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
@@ -697,7 +704,7 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
+        if !map_from(&mut physical, base + i * PAGE, run * PAGE, first, origin) {
             return std::ptr::null_mut();
         }
         i += run;
@@ -727,7 +734,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        if map_physical(address, 1, page, Origin::Scatter).is_null() {
             return 0;
         }
     }
@@ -771,7 +778,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map_from(&mut physical, to + k, PAGE, slice, Origin::Alias) {
             return false;
         }
     }
@@ -789,7 +796,8 @@ pub fn map_alias_repeated(to: u64, from: u64, len: u64) -> bool {
             victory_gpu::framelog::add(victory_gpu::framelog::T::RepeatPotentialPages, len / PAGE as u64);
             if enabled {
                 let _changing = victory_gpu::title_memory_remapping();
-                if let Some(result) = repeat_alias_batch(&mut p, to as usize, from as usize, len as usize, map) {
+                if let Some(result) = repeat_alias_batch(&mut p, to as usize, from as usize, len as usize,
+                    |p, at, bytes, slice| map_from(p, at, bytes, slice, Origin::Batch)) {
                     return result;
                 }
             }
@@ -908,18 +916,27 @@ fn resident_shared(at: usize, len: usize) -> bool {
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
+#[cfg(test)]
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
-    victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalMapCalls, 1);
+    map_from(physical, base, len, slice, Origin::Other)
+}
+
+fn map_from(physical: &mut Physical, base: usize, len: usize, slice: Slice, origin: Origin) -> bool {
+    framelog::add(T::PhysicalMapCalls, 1);
+    let _attempt = diagnostics::Attempt::new(origin, len);
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
-    let view = unsafe {
+    measured(T::PhysicalSplitUs, || unsafe {
         VirtualFree(
             base as *mut c_void,
             len,
             MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
+        )
+    });
+    let (view, error) = measured(T::PhysicalMapViewUs, || {
+        // SAFETY: the same owned placeholder and section as above.
+        let view = unsafe { MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
             base as *const c_void,
@@ -929,30 +946,35 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             PAGE_READWRITE,
             std::ptr::null_mut(),
             0,
-        )
-    };
-    if view.Value as usize != base {
+        ) };
+        // Capture last-error before the timing query can call any host API.
+        let error = (view.Value as usize != base).then(std::io::Error::last_os_error);
+        (view, error)
+    });
+    if let Some(error) = error {
         tracing::warn!(
             address = format_args!("{base:#x}"),
             len,
-            error = %std::io::Error::last_os_error(),
+            error = %error,
             "mapping physical pages failed (not a placeholder?)"
         );
         return false;
     }
-    if !commit(base, len) {
+    if !measured(T::PhysicalCommitUs, || commit(base, len)) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
     // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
+    measured(T::PhysicalNotifyUs, || victory_gpu::title_memory_remapped(base, len));
     // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
-    for k in 0..len.div_ceil(PAGE) {
-        physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
-    }
-    physical.views.insert(base, (len, slice));
+    measured(T::PhysicalViewUs, || victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64));
+    measured(T::PhysicalBookkeepingUs, || {
+        for k in 0..len.div_ceil(PAGE) {
+            physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        }
+        physical.views.insert(base, (len, slice));
+    });
     true
 }
 
@@ -1016,33 +1038,37 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     let end = base + len;
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
-    let first = physical
-        .views
-        .range(..=base)
-        .next_back()
-        .filter(|(at, (size, _))| *at + size > base)
-        .map(|(at, _)| *at);
-    let hit: Vec<usize> = first
-        .into_iter()
-        .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
-        .collect();
+    let hit: Vec<usize> = measured(T::PhysicalRemovalUs, || {
+        let first = physical
+            .views
+            .range(..=base)
+            .next_back()
+            .filter(|(at, (size, _))| *at + size > base)
+            .map(|(at, _)| *at);
+        first.into_iter()
+            .chain(physical.views.range(base + 1..end).map(|(at, _)| *at))
+            .collect()
+    });
+    if hit.is_empty() { framelog::add(T::PhysicalUnmapEmptyCalls, 1); }
     for at in hit {
-        let Some((size, slice)) = physical.views.remove(&at) else {
-            continue;
-        };
-        for k in 0..size.div_ceil(PAGE) {
-            let key = slice.key(k);
-            if let Some(addresses) = physical.shown.get_mut(&key) {
-                addresses.retain(|&a| a != at + k * PAGE);
-                if addresses.is_empty() {
-                    physical.shown.remove(&key);
+        let Some((size, slice)) = measured(T::PhysicalRemovalUs, || {
+            let (size, slice) = physical.views.remove(&at)?;
+            for k in 0..size.div_ceil(PAGE) {
+                let key = slice.key(k);
+                if let Some(addresses) = physical.shown.get_mut(&key) {
+                    addresses.retain(|&a| a != at + k * PAGE);
+                    if addresses.is_empty() {
+                        physical.shown.remove(&key);
+                    }
                 }
             }
-        }
-        victory_gpu::title_memory_remapped(at, size);
+            Some((size, slice))
+        }) else { continue; };
+        measured(T::PhysicalNotifyUs, || victory_gpu::title_memory_remapped(at, size));
         victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalUnmapCalls, 1);
+        framelog::add(T::PhysicalUnmapBytes, size as u64);
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        measured(T::PhysicalNativeUnmapUs, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -1050,15 +1076,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        });
         if at < base {
             victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalTailPages, ((base - at) / PAGE) as u64);
-            map(physical, at, base - at, slice.clone());
+            map_from(physical, at, base - at, slice.clone(), Origin::Tail);
         }
         if at + size > end {
             victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalTailPages, ((at + size - end) / PAGE) as u64);
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map_from(physical, end, at + size - end, Slice { index, ..slice }, Origin::Tail);
         }
     }
 }

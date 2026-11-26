@@ -79,6 +79,25 @@ pub enum T {
     RepeatPotentialPages,
     RepeatBatchPages,
     RepeatRestoreFailures,
+    /// Actual physical map attempts by caller (calls, requested bytes, wall us).
+    DirectMapCalls, DirectMapBytes, DirectMapUs,
+    ScatterMapCalls, ScatterMapBytes, ScatterMapUs,
+    AliasMapCalls, AliasMapBytes, AliasMapUs,
+    BatchMapCalls, BatchMapBytes, BatchMapUs,
+    TailMapCalls, TailMapBytes, TailMapUs,
+    OtherMapCalls, OtherMapBytes, OtherMapUs,
+    /// Nonoverlapping phases of map/unmap helpers, summed over all threads.
+    PhysicalSplitUs,
+    PhysicalMapViewUs,
+    PhysicalCommitUs,
+    PhysicalNotifyUs,
+    PhysicalViewUs,
+    PhysicalBookkeepingUs,
+    PhysicalRemovalUs,
+    PhysicalLockUs,
+    PhysicalNativeUnmapUs,
+    PhysicalUnmapBytes,
+    PhysicalUnmapEmptyCalls,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -636,6 +655,24 @@ pub fn frame() {
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }
+    // Raw cumulative snapshot, including work in omitted long frames. The
+    // atomics are read separately, not a transaction across worker threads.
+    let t = |counter: T| totals[counter as usize];
+    tracing::info!(
+        "physical mapping totals: direct {}/{}/{} scatter {}/{}/{} alias {}/{}/{} batch {}/{}/{} tail {}/{}/{} other {}/{}/{} \
+         (attempts/bytes/us); map/unmap {}/{} unmap bytes {} no-view unmaps {}; tail pages {} repeat potential {} batched {} restore failures {}; \
+         phase us split {} mapview {} commit {} notify {} view {} insertion {} removal {} unmap {} physical-lock {}",
+        t(T::DirectMapCalls), t(T::DirectMapBytes), t(T::DirectMapUs),
+        t(T::ScatterMapCalls), t(T::ScatterMapBytes), t(T::ScatterMapUs),
+        t(T::AliasMapCalls), t(T::AliasMapBytes), t(T::AliasMapUs),
+        t(T::BatchMapCalls), t(T::BatchMapBytes), t(T::BatchMapUs),
+        t(T::TailMapCalls), t(T::TailMapBytes), t(T::TailMapUs),
+        t(T::OtherMapCalls), t(T::OtherMapBytes), t(T::OtherMapUs),
+        t(T::PhysicalMapCalls), t(T::PhysicalUnmapCalls), t(T::PhysicalUnmapBytes), t(T::PhysicalUnmapEmptyCalls),
+        t(T::PhysicalTailPages), t(T::RepeatPotentialPages), t(T::RepeatBatchPages), t(T::RepeatRestoreFailures),
+        t(T::PhysicalSplitUs), t(T::PhysicalMapViewUs), t(T::PhysicalCommitUs), t(T::PhysicalNotifyUs),
+        t(T::PhysicalViewUs), t(T::PhysicalBookkeepingUs), t(T::PhysicalRemovalUs), t(T::PhysicalNativeUnmapUs), t(T::PhysicalLockUs),
+    );
 }
 
 #[cfg(test)]

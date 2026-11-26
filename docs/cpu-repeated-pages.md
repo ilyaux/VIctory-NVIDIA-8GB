@@ -50,4 +50,35 @@ They do not force a real Windows commit OOM or native cleanup failure.
 The runtime registers a separate repeated-page callback; other users of the
 original consecutive-page mapper retain its signature and behavior. The queue
 also keeps its original fallback when no repeated callback is installed.
-Native eligibility, image fidelity and frame-rate effects remain unverified.
+Native probes have not established a frame-rate contribution. All published
+frame-detail samples of the first same-binary control/candidate had zero tail,
+candidate and batched pages. Those samples omit some long frames, so they do
+not establish zero work across the complete runs. The option remains off.
+
+## Mapping diagnostics
+
+With frame logging enabled, a separate `physical mapping totals` line reports
+cumulative counters every reading, including work in unlisted long frames.
+Each actual mapping attempt has exactly one origin: direct physical mapping,
+one scatter item, queue alias, restricted repeated-source batch, or remapped
+tail. The `other` origin is reserved for direct calls in CPU fixtures. Counts
+are attempts, including failures; bytes are requested view sizes. They are not
+allocation counts or unique committed bytes. Temporary DirectStorage views
+use a different helper and are not included.
+
+Origin wall time covers the mapping helper, including commit, notifications
+and table registration. Phase times separately measure placeholder splitting,
+MapViewOfFile3, commit, remapping notifications, view registration, map-table
+insertion, unmap-table search/removal and native unmapping. A separate lock
+timer includes all users of the physical table, including readers outside the
+mapping helpers. Phase times are not additional work to add to origin times.
+Failed-commit rollback unmapping is outside those phase timers. `no-view unmaps` counts requests
+that found no tracked destination view, including explicit unmap requests;
+it does not mean every alias shape rejection was a fresh destination.
+
+The cumulative snapshot reads independent atomic counters, so an in-progress
+operation may have its attempt counted before its time is recorded. Compare
+intervals with that boundary in mind. These timers sum wall time across threads,
+not critical-path time saved. Each individual duration is truncated to whole
+microseconds before addition: a zero phase total does not prove absence of work.
+When frame logging is off, no timing query runs.
