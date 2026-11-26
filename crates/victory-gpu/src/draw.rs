@@ -690,6 +690,11 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A host library changed the list's bindings; restore them before the next draw.
+    pub(crate) fn host_state_lost(&mut self) {
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     pub(crate) fn set_heaps(&mut self, heaps: &[This]) {
         self.heaps = [0; 2];
         for &h in heaps {

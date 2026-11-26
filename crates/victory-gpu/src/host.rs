@@ -648,6 +648,9 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Ok(wanted) = std::env::var("VICTORY_D3D12_ADAPTER") {
+            let adapter = adapter_named(&wanted)?;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -769,6 +772,38 @@ pub(crate) fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
     }
 }
 
+/// An explicitly named hardware adapter; never falls back to the system default.
+fn adapter_named(wanted: &str) -> windows::core::Result<IDXGIAdapter1> {
+    // SAFETY: DXGI metadata queries only; no D3D12 device is created here.
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+        let mut found = None;
+        for index in 0.. {
+            let adapter = match factory.EnumAdapters1(index) {
+                Ok(adapter) => adapter,
+                Err(e) if e.code() == DXGI_ERROR_NOT_FOUND => break,
+                Err(e) => return Err(e),
+            };
+            let desc = adapter.GetDesc1()?;
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            let name = String::from_utf16_lossy(&desc.Description[..end]);
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 && name == wanted {
+                if found.is_some() {
+                    return Err(windows::core::Error::new(
+                        windows::Win32::Foundation::E_INVALIDARG,
+                        "the requested D3D12 adapter name is ambiguous",
+                    ));
+                }
+                found = Some(adapter);
+            }
+        }
+        found.ok_or_else(|| windows::core::Error::new(
+            windows::Win32::Foundation::E_INVALIDARG,
+            format!("no hardware D3D12 adapter named {wanted}"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -807,6 +842,12 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn named_adapter_does_not_fall_back() {
+        assert!(adapter_named("VIctory synthetic missing adapter").is_err());
+        assert!(adapter_named("Microsoft Basic Render Driver").is_err());
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {

@@ -19,6 +19,9 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Select the optional host upscaler before the import registry is first used.
+    let fidelityfx = std::env::var_os("VICTORY_FIDELITYFX_DIR").map(std::path::PathBuf::from);
+    victory_hle::modules::fidelityfx::use_host_dir(fidelityfx.as_deref());
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
