@@ -136,7 +136,7 @@ fn present_behind() -> bool {
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes != 1 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -894,7 +894,7 @@ fn release_held_now(all: bool) {
                     Held::Present(texture, state, frame) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let _ = host.present(&[(&texture, state)], frame);
                             }
                         };
                         if all {
@@ -1114,13 +1114,16 @@ fn execute_now(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// PresentX plane (canonical 0736f8b/#1997): frame token and resource list,
+/// with the remaining fields retained so consecutive planes have their ABI stride.
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    _rest: [u64; 6],
 }
+const _: () = assert!(std::mem::size_of::<Plane>() == 0x48);
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1281,10 +1284,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
-///
-/// shortcut: one plane, no scaling or placement, the source expected in
-/// the common state.
+/// Presents every plane in title order; later planes are premultiplied overlays.
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1321,7 +1321,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
     if sent_behind {
-    } else if crate::host::late() && !crate::host::late_free_present() {
+    } else if crate::host::late() && (planes > 1 || !crate::host::late_free_present()) {
         // (With `behind`: what the queues hold runs here first, and what
         // it sent is settled with the rest.)
         if behind() {
@@ -1390,26 +1390,60 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         }
     }
     #[cfg(windows)]
-    if !sent_behind
-        && planes > 0
-        // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
-        && let Some(texture) = crate::resource::host_resource(resource)
+    if !sent_behind && planes > 0 && !plane_parameters.is_null()
         && let Some(host) = crate::host::host()
     {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        use windows::core::Interface;
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
+        // shortcut: like canonical #1997, at most eight display planes; extend
+        // this bound if a title presents more rather than indexing unbounded input.
+        // SAFETY: the title supplies planes consecutive 0x48-byte records.
+        let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         #[cfg(feature = "diagnostics")]
-        blinks(frame, resource, state, shown);
-        #[cfg(not(feature = "diagnostics"))]
-        let _ = shown;
+        let log_planes = frame == 1 || crate::capture::listed(frame);
+        #[cfg(feature = "diagnostics")]
+        if log_planes { tracing::info!(frame, planes, "PresentX plane metadata"); }
+        let mut resources: Vec<(This, ID3D12Resource, u32, bool)> = Vec::with_capacity(slice.len());
+        for (index, plane) in slice.iter().enumerate() {
+            if plane.count == 0 || plane.resources.is_null() {
+                #[cfg(feature = "diagnostics")]
+                if log_planes { tracing::info!(frame, index, token = plane.token, count = plane.count, "PresentX empty plane"); }
+                continue;
+            }
+            // SAFETY: the title supplies a list of count resource pointers.
+            let resource = unsafe { *plane.resources };
+            #[cfg(feature = "diagnostics")]
+            if log_planes {
+                let memory = crate::resource::texture_memory(resource).map(|(at, desc)| {
+                    (at as usize, format!("{desc:?}"))
+                });
+                tracing::info!(frame, index, token = plane.token, count = plane.count, ?resource, ?memory, "PresentX plane");
+            }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = index;
+            if let Some(texture) = crate::resource::host_resource(resource).cloned() {
+                // Borrowed host_resource must become an owned clone until present
+                // completes; aliases also restore one shared state only once.
+                let prior = resources.iter().find_map(|(_, earlier, state, _)| {
+                    (earlier.as_raw() == texture.as_raw()).then_some(*state)
+                });
+                let state = prior.unwrap_or_else(|| crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before));
+                resources.push((resource, texture, state, prior.is_none()));
+            }
+        }
+        if !resources.is_empty() {
+            let sources: Vec<_> = resources.iter().map(|(_, texture, state, _)| (texture, *state)).collect();
+            let shown = host.present(&sources, frame);
+            for &(resource, _, state, first) in &resources {
+                if first { crate::resource::host_transition(resource, state); }
+            }
+            #[cfg(feature = "diagnostics")]
+            blinks(frame, resources[0].0, resources[0].2, shown);
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = shown;
+        }
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
@@ -1579,6 +1613,21 @@ static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn present_plane_layout_has_the_console_array_stride() {
+        assert_eq!(std::mem::size_of::<Plane>(), 0x48);
+        assert_eq!(std::mem::offset_of!(Plane, token), 0);
+        assert_eq!(std::mem::offset_of!(Plane, count), 8);
+        assert_eq!(std::mem::offset_of!(Plane, resources), 16);
+        let planes = [
+            Plane { token: 11, count: 0, resources: std::ptr::null(), _rest: [0; 6] },
+            Plane { token: 22, count: 0, resources: std::ptr::null(), _rest: [0; 6] },
+        ];
+        assert_eq!((&planes[1] as *const Plane as usize) - (&planes[0] as *const Plane as usize), 0x48);
+        assert_eq!(planes[1].token, 22);
+    }
+
 
     #[cfg(windows)]
     #[test]

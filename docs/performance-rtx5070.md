@@ -199,3 +199,41 @@ changes and recovery, and reports failed presents as not shown. The queue's
 periodic counter is labelled as presentation requests. This is diagnostic
 coverage, not a fix for the black picture; a targeted source-frame readback
 is still needed to distinguish empty rendering from a presentation failure.
+
+Run12 made that distinction with internal source-frame readback on the
+explicit RTX adapter. Of 185 saved frames, the early frames were entirely
+black before DXGI; four later world frames contained an image. No nonzero
+DXGI presentation status was logged. The first world image was frame 2848.
+Black faces, missing geometry and exposure defects remained. Capture waits
+make this a correctness observation, not a comparable FPS result.
+
+The command trace records video-plane uploads, conversion into an RGB
+texture and composition into a 3840x2160 UI target, while this fork presents
+only the first plane's 1920x1080 texture. Canonical
+[0736f8b](https://github.com/Marvisak/VIctory/commit/0736f8b375c3ae95fca0a21af6aa0b6cbc1251cf)
+by Calvix2k addresses missing Series S UI with ordered multi-plane
+composition. This is the current candidate; recording the actual plane
+array and validating composed pixels are required before claiming a fix.
+
+The adapted compositor preserves the single-plane ahead path; multiple
+planes complete synchronously so their descriptor heaps can be reused
+safely. The console plane stride and field offsets passed a CPU-only test.
+Three manual tests passed first on explicit WARP and then on the exact RTX
+5070: spatial 2x2-to-8x8 scaling, three-plane premultiplied blending and
+order, repeated source state transitions, retained source identities and
+failure fallback followed by retry, and an unsampleable depth-only source
+that falls back before SRV creation and recovers with valid input. A CPU
+regression checks typed formats, typeless mapping and rejected source
+descriptions. Tests inspect completed pixel readback
+before flip-discard presentation. They are ignored by default and require
+both an explicit device selection and `VICTORY_PRESENT_GPU_TESTS=1`; the
+actual device identity is checked before recording graphics commands.
+Normal and diagnostics compilation passed. This validates the synthetic
+mechanism; the real Series S plane array and picture still need verification.
+
+A separate placed-UAV adaptation was rejected during static review before
+any GPU execution. Replacing a filled read-only backing with a new writable
+backing can lose untouched texels and mip levels on a partial write. Full
+overwrite tests do not cover that contract. Default views also need a valid
+typed format when storage becomes typeless. That candidate is outside the
+working branch and is not treated as a rendering fix.

@@ -9,14 +9,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, ID3DBlob};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Interface, PCWSTR, w};
+use windows::core::{Interface, PCSTR, PCWSTR, s, w};
 
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
@@ -7908,11 +7909,245 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
     })
 }
 
+/// An SRV the float-sampling PresentX compositor can legally bind. Copying
+/// plane0 needs no SRV, so unsupported sources retain that original path.
+fn present_plane_srv_format(desc: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        || desc.DepthOrArraySize != 1
+        || desc.SampleDesc.Count != 1
+        || desc.Flags.0 & (D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0) != 0
+    {
+        return None;
+    }
+    Some(match desc.Format {
+        DXGI_FORMAT_R32G32B32A32_TYPELESS => DXGI_FORMAT_R32G32B32A32_FLOAT,
+        DXGI_FORMAT_R16G16B16A16_TYPELESS => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R32G32_TYPELESS => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R10G10B10A2_TYPELESS => DXGI_FORMAT_R10G10B10A2_UNORM,
+        DXGI_FORMAT_R8G8B8A8_TYPELESS => DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_R16G16_TYPELESS => DXGI_FORMAT_R16G16_FLOAT,
+        DXGI_FORMAT_R32_TYPELESS => DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R8G8_TYPELESS => DXGI_FORMAT_R8G8_UNORM,
+        DXGI_FORMAT_R16_TYPELESS => DXGI_FORMAT_R16_FLOAT,
+        DXGI_FORMAT_R8_TYPELESS => DXGI_FORMAT_R8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_TYPELESS => DXGI_FORMAT_B8G8R8A8_UNORM,
+        DXGI_FORMAT_B8G8R8X8_TYPELESS => DXGI_FORMAT_B8G8R8X8_UNORM,
+        DXGI_FORMAT_R32G32B32A32_FLOAT
+        | DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16B16A16_UNORM | DXGI_FORMAT_R16G16B16A16_SNORM
+        | DXGI_FORMAT_R32G32_FLOAT | DXGI_FORMAT_R10G10B10A2_UNORM | DXGI_FORMAT_R11G11B10_FLOAT
+        | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB | DXGI_FORMAT_R8G8B8A8_SNORM
+        | DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16G16_UNORM | DXGI_FORMAT_R16G16_SNORM
+        | DXGI_FORMAT_R32_FLOAT | DXGI_FORMAT_R8G8_UNORM | DXGI_FORMAT_R8G8_SNORM
+        | DXGI_FORMAT_R16_FLOAT | DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_R16_SNORM
+        | DXGI_FORMAT_R8_UNORM | DXGI_FORMAT_R8_SNORM | DXGI_FORMAT_A8_UNORM
+        | DXGI_FORMAT_R9G9B9E5_SHAREDEXP
+        | DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        | DXGI_FORMAT_B8G8R8X8_UNORM | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB => desc.Format,
+        // Integer textures need integer loads, not Texture2D<float4>.Sample;
+        // other families are left to copy-present until explicitly supported.
+        _ => return None,
+    })
+}
+
 const BUFFERS: u32 = 2;
+const MAX_PLANES: u32 = 8;
+
+// Adapted from Calvix2k et al., canonical 0736f8b (#1997), preserving premultiplied plane order.
+/// Built-in fullscreen-triangle compositor for multi-plane `PresentX` calls
+/// (e.g. Series S presenting a 1080p scene plane with a 4K UI overlay plane).
+struct Compositor {
+    format: DXGI_FORMAT,
+    root: ID3D12RootSignature,
+    opaque: ID3D12PipelineState,
+    overlay: ID3D12PipelineState,
+    rtv_heap: ID3D12DescriptorHeap,
+    srv_heap: ID3D12DescriptorHeap,
+    srv_stride: u32,
+}
+
+impl Compositor {
+    fn new(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Self> {
+        const SOURCE: &str = r#"
+            Texture2D tex : register(t0);
+            SamplerState smp : register(s0);
+            void vs(uint id : SV_VertexID, out float4 pos : SV_Position, out float2 uv : TEXCOORD) {
+                uv = float2((id << 1) & 2, id & 2);
+                pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+            }
+            float4 ps(float4 pos : SV_Position, float2 uv : TEXCOORD) : SV_Target {
+                return tex.Sample(smp, uv);
+            }
+        "#;
+        let compile = |entry: PCSTR, target: PCSTR| -> windows::core::Result<ID3DBlob> {
+            let mut code: Option<ID3DBlob> = None;
+            let mut errors: Option<ID3DBlob> = None;
+            // SAFETY: static source and entry/target strings; out pointers ours.
+            let res = unsafe {
+                D3DCompile(
+                    SOURCE.as_ptr().cast(),
+                    SOURCE.len(),
+                    s!("present_composite"),
+                    None,
+                    None,
+                    entry,
+                    target,
+                    0,
+                    0,
+                    &mut code,
+                    Some(&mut errors),
+                )
+            };
+            if let Err(e) = res {
+                if let Some(errors) = errors {
+                    // SAFETY: the blob's own bytes.
+                    let text = unsafe {
+                        std::slice::from_raw_parts(
+                            errors.GetBufferPointer().cast::<u8>(),
+                            errors.GetBufferSize(),
+                        )
+                    };
+                    tracing::warn!("present compositor: {}", String::from_utf8_lossy(text));
+                }
+                return Err(e);
+            }
+            code.ok_or_else(windows::core::Error::empty)
+        };
+        let vs = compile(s!("vs"), s!("vs_5_1"))?;
+        let ps = compile(s!("ps"), s!("ps_5_1"))?;
+        // SAFETY: compiled shader blobs live through PSO creation.
+        unsafe {
+            let vs_bytes =
+                std::slice::from_raw_parts(vs.GetBufferPointer().cast::<u8>(), vs.GetBufferSize());
+            let ps_bytes =
+                std::slice::from_raw_parts(ps.GetBufferPointer().cast::<u8>(), ps.GetBufferSize());
+            // Wine's D3DCompile does not embed a root signature in the shader blobs.
+            let range = D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 1,
+                OffsetInDescriptorsFromTableStart: D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND,
+                ..Default::default()
+            };
+            let parameter = D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+            };
+            let sampler = D3D12_STATIC_SAMPLER_DESC {
+                Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+                AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+                AddressW: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+                MaxAnisotropy: 16,
+                ComparisonFunc: D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                BorderColor: D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE,
+                MaxLOD: f32::MAX,
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+                ..Default::default()
+            };
+            let desc = D3D12_ROOT_SIGNATURE_DESC {
+                NumParameters: 1,
+                pParameters: &parameter,
+                NumStaticSamplers: 1,
+                pStaticSamplers: &sampler,
+                ..Default::default()
+            };
+            let mut signature = None;
+            D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut signature, None)?;
+            let signature = signature.ok_or_else(windows::core::Error::empty)?;
+            let signature = std::slice::from_raw_parts(
+                signature.GetBufferPointer().cast::<u8>(),
+                signature.GetBufferSize(),
+            );
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, signature)?;
+            let make_pso = |blend: bool| -> windows::core::Result<ID3D12PipelineState> {
+                let mut rt_blend = D3D12_RENDER_TARGET_BLEND_DESC {
+                    RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+                    ..Default::default()
+                };
+                if blend {
+                    rt_blend.BlendEnable = true.into();
+                    rt_blend.SrcBlend = D3D12_BLEND_ONE;
+                    rt_blend.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                    rt_blend.BlendOp = D3D12_BLEND_OP_ADD;
+                    rt_blend.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    rt_blend.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    rt_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                }
+                let mut blend_desc = D3D12_BLEND_DESC::default();
+                blend_desc.RenderTarget[0] = rt_blend;
+                let mut rtv_formats = [DXGI_FORMAT_UNKNOWN; 8];
+                rtv_formats[0] = format;
+                let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(root.clone())),
+                    VS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: vs_bytes.as_ptr().cast(),
+                        BytecodeLength: vs_bytes.len(),
+                    },
+                    PS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: ps_bytes.as_ptr().cast(),
+                        BytecodeLength: ps_bytes.len(),
+                    },
+                    BlendState: blend_desc,
+                    SampleMask: u32::MAX,
+                    RasterizerState: D3D12_RASTERIZER_DESC {
+                        FillMode: D3D12_FILL_MODE_SOLID,
+                        CullMode: D3D12_CULL_MODE_NONE,
+                        DepthClipEnable: false.into(),
+                        ..Default::default()
+                    },
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    RTVFormats: rtv_formats,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    ..Default::default()
+                };
+                let pso = device.CreateGraphicsPipelineState(&desc);
+                let _ = std::mem::ManuallyDrop::into_inner(desc.pRootSignature);
+                pso
+            };
+            let opaque = make_pso(false)?;
+            let overlay = make_pso(true)?;
+            let rtv_heap: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                    NodeMask: 0,
+                })?;
+            let srv_heap: ID3D12DescriptorHeap =
+                device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: MAX_PLANES,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })?;
+            let srv_stride =
+                device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            Ok(Compositor {
+                format,
+                root,
+                opaque,
+                overlay,
+                rtv_heap,
+                srv_heap,
+                srv_stride,
+            })
+        }
+    }
+}
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
     present_status: i32,
+    compositor: Option<Compositor>,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -8235,25 +8470,83 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    /// Shows all PresentX planes in order, with premultiplied overlays scaled
+    /// to the largest plane. Single-plane copies retain the ahead-present path.
+    pub(crate) fn present(&self, planes: &[(&ID3D12Resource, u32)], frame: u64) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_with_compositor(
+            planes, frame, Compositor::new,
+            #[cfg(all(test, feature = "diagnostics"))]
+            |_, _| {},
+        );
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        // SAFETY: a live resource.
-        let desc = unsafe { texture.GetDesc() };
-        let Some(format) = swap_format(desc.Format) else {
-            tracing::warn!(format = desc.Format.0, "cannot present this format");
+    fn present_with_compositor(
+        &self,
+        planes: &[(&ID3D12Resource, u32)],
+        frame: u64,
+        create_compositor: impl FnOnce(&ID3D12Device, DXGI_FORMAT) -> windows::core::Result<Compositor>,
+        #[cfg(all(test, feature = "diagnostics"))] inspect: impl FnOnce(
+            &ID3D12Resource,
+            &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        ),
+    ) -> Option<bool> {
+        let &(primary, _) = planes.first()?;
+        let synchronous = planes.len() > 1;
+        // SAFETY: live resources.
+        let primary_desc = unsafe { primary.GetDesc() };
+        let Some(format) = swap_format(primary_desc.Format) else {
+            tracing::warn!(format = primary_desc.Format.0, "cannot present this format");
             return None;
         };
-        let (width, height) = (desc.Width as u32, desc.Height);
+        // Preflight every source before creating a compositor or an SRV. A
+        // cached compositor must not bypass eligibility on a later frame.
+        let unsupported = if planes.len() > 1 {
+            planes.iter().enumerate().find_map(|(index, &(texture, _))| {
+                // SAFETY: the caller holds every source resource for this call.
+                let desc = unsafe { texture.GetDesc() };
+                present_plane_srv_format(&desc).is_none().then_some((index, desc))
+            })
+        } else { None };
+        static UNSUPPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let was_unsupported = UNSUPPORTED.swap(unsupported.is_some(), Ordering::Relaxed);
+        if let Some((index, desc)) = unsupported {
+            if !was_unsupported {
+                tracing::warn!(frame, index, format = desc.Format.0, flags = desc.Flags.0,
+                    dimension = desc.Dimension.0, layers = desc.DepthOrArraySize, samples = desc.SampleDesc.Count,
+                    "PresentX source cannot be sampled; presenting the primary plane");
+            }
+        }
+        let planes = if unsupported.is_some() { &planes[..1] } else { planes };
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+        let cached_format = presenter
+            .as_ref()
+            .and_then(|p| p.compositor.as_ref())
+            .map(|c| c.format);
+        let mut new_compositor = None;
+        let planes = if planes.len() > 1 && cached_format != Some(format) {
+            match create_compositor(&self.device, format) {
+                Ok(c) => {
+                    new_compositor = Some(c);
+                    planes
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "presenting the primary plane after compositor initialization failed");
+                    &planes[..1]
+                }
+            }
+        } else {
+            planes
+        };
+        let (mut width, mut height) = (primary_desc.Width as u32, primary_desc.Height);
+        for &(tex, _) in &planes[1..] {
+            // SAFETY: live resource.
+            let d = unsafe { tex.GetDesc() };
+            width = width.max(d.Width as u32);
+            height = height.max(d.Height);
+        }
         if presenter.is_none() {
             *presenter = match self.presenter(width, height, format) {
                 Ok(p) => Some(p),
@@ -8264,9 +8557,17 @@ impl Host {
             };
         }
         let p = presenter.as_mut()?;
+        if let Some(c) = new_compositor {
+            p.compositor = Some(c);
+        }
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
+            // Release recorded/back-buffer COM references only after all their
+            // presents finish, before DXGI replaces those buffers.
+            p.copy.reset();
+            p.copy.close();
+            p.ahead.clear();
             // SAFETY: no back buffer is held; every submission was waited for.
             let resized = unsafe {
                 p.swap_chain
@@ -8290,21 +8591,19 @@ impl Host {
                 }
             }
         }
-        let state = D3D12_RESOURCE_STATES(state as i32);
-        // SAFETY: our swap chain, list and a live source texture.
+        // SAFETY: our swap chain, list and live source textures.
         unsafe {
             let index = p.swap_chain.GetCurrentBackBufferIndex();
             let Ok(back) = p.swap_chain.GetBuffer::<ID3D12Resource>(index) else {
                 return None;
             };
-            // Sent ahead ([`late_free_present`]) unless the frame is to be
-            // read back at once (a saved or listed frame): then a list of
-            // its own, one whose last flight has finished or a new one.
+            // Only one-plane copies may run ahead. Shared compositor descriptors
+            // are rewritten next call, so a composed present completes here.
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = cfg!(test) || crate::capture::wanted(frame) || crate::capture::listed(frame);
             #[cfg(not(feature = "diagnostics"))]
             let read_now = false;
-            let slot = if late_free_present() && !read_now {
+            let slot = if late_free_present() && !read_now && !synchronous {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                     let list = self.new_list().ok()?;
@@ -8312,53 +8611,208 @@ impl Host {
                     p.ahead.push((list, 0));
                     Some(p.ahead.len() - 1)
                 })
-            } else {
-                None
-            };
-            let copy = match slot {
-                Some(i) => &p.ahead[i].0,
-                None => &p.copy,
-            };
+            } else { None };
+            let copy = match slot { Some(i) => &p.ahead[i].0, None => &p.copy };
             copy.reset();
+            copy.keep(&back);
+            for &(texture, _) in planes { copy.keep(texture); }
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            let (capture, probe) = if planes.len() == 1 {
+                let (texture, state) = planes[0];
+                let state = D3D12_RESOURCE_STATES(state as i32);
+                let mut before = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    before.push(transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE));
+                }
+                before.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
-            // The frame rate, into the corner of what is shown (not of the
-            // title's own frame, which the lines below read back).
-            crate::fpsbox::draw(self, list, &back, (width, height, format));
-            #[cfg(feature = "diagnostics")]
-            let capture = crate::capture::wanted(frame)
-                .then(|| crate::capture::read_back(&self.device, list, texture))
-                .flatten();
-            #[cfg(feature = "diagnostics")]
-            let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
-            #[cfg(not(feature = "diagnostics"))]
-            let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+                ));
+                list.ResourceBarrier(&before);
+                list.CopyResource(&back, texture);
+                #[cfg(all(test, feature = "diagnostics"))]
+                let capture = {
+                    // Inspect what reached the swap chain, before Present.
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let readback = crate::capture::read_back(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    readback
+                };
+                #[cfg(all(not(test), feature = "diagnostics"))]
+                let capture = crate::capture::wanted(frame)
+                    .then(|| crate::capture::read_back(&self.device, list, texture))
+                    .flatten();
+                #[cfg(feature = "diagnostics")]
+                let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
+                #[cfg(not(feature = "diagnostics"))]
+                let (capture, probe) = {
+                    let _ = frame;
+                    (None::<()>, None::<()>)
+                };
+                crate::fpsbox::draw(self, list, &back, (width, height, format));
+                let mut after = Vec::with_capacity(2);
+                if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                    after.push(transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state));
+                }
+                after.push(transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+                ));
+                list.ResourceBarrier(&after);
+                (capture, probe)
+            } else {
+                let comp = p.compositor.as_ref().expect("compositor was prepared for multiple planes");
+                let rtv = comp.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+                self.device.CreateRenderTargetView(
+                    &back,
+                    Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                        Format: format,
+                        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                        Anonymous: D3D12_RENDER_TARGET_VIEW_DESC_0 {
+                            Texture2D: D3D12_TEX2D_RTV {
+                                MipSlice: 0,
+                                PlaneSlice: 0,
+                            },
+                        },
+                    }),
+                    rtv,
+                );
+                let srv_cpu_base = comp.srv_heap.GetCPUDescriptorHandleForHeapStart();
+                let srv_gpu_base = comp.srv_heap.GetGPUDescriptorHandleForHeapStart();
+                let count = planes.len().min(MAX_PLANES as usize);
+                let mut before = Vec::with_capacity(count + 1);
+                let mut after = Vec::with_capacity(count);
+                for (i, &(tex, state)) in planes[..count].iter().enumerate() {
+                    let d = tex.GetDesc();
+                    let srv_fmt = present_plane_srv_format(&d).expect("all compositor sources preflighted");
+                    let handle = D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: srv_cpu_base.ptr + i * comp.srv_stride as usize,
+                    };
+                    self.device.CreateShaderResourceView(
+                        tex,
+                        Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: srv_fmt,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                Texture2D: D3D12_TEX2D_SRV {
+                                    MostDetailedMip: 0,
+                                    MipLevels: 1,
+                                    PlaneSlice: 0,
+                                    ResourceMinLODClamp: 0.0,
+                                },
+                            },
+                        }),
+                        handle,
+                    );
+                    let state = D3D12_RESOURCE_STATES(state as i32);
+                    if state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                        && planes[..i]
+                            .iter()
+                            .all(|(earlier, _)| earlier.as_raw() != tex.as_raw())
+                    {
+                        before.push(transition(
+                            tex,
+                            state,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                        ));
+                        after.push(transition(
+                            tex,
+                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                            state,
+                        ));
+                    }
+                }
+                before.push(transition(
+                    &back,
+                    D3D12_RESOURCE_STATE_PRESENT,
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                ));
+                list.ResourceBarrier(&before);
+                list.SetDescriptorHeaps(&[Some(comp.srv_heap.clone())]);
+                list.SetGraphicsRootSignature(&comp.root);
+                list.RSSetViewports(&[D3D12_VIEWPORT {
+                    TopLeftX: 0.0,
+                    TopLeftY: 0.0,
+                    Width: width as f32,
+                    Height: height as f32,
+                    MinDepth: 0.0,
+                    MaxDepth: 1.0,
+                }]);
+                list.RSSetScissorRects(&[RECT {
+                    left: 0,
+                    top: 0,
+                    right: width as i32,
+                    bottom: height as i32,
+                }]);
+                list.OMSetRenderTargets(1, Some(&rtv), false, None);
+                list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+                for i in 0..count {
+                    list.SetPipelineState(if i == 0 { &comp.opaque } else { &comp.overlay });
+                    list.SetGraphicsRootDescriptorTable(
+                        0,
+                        D3D12_GPU_DESCRIPTOR_HANDLE {
+                            ptr: srv_gpu_base.ptr + (i as u64) * u64::from(comp.srv_stride),
+                        },
+                    );
+                    list.DrawInstanced(3, 1, 0, 0);
+                }
+                #[cfg(feature = "diagnostics")]
+                let (capture, probe) = {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let capture = (cfg!(test) || crate::capture::wanted(frame))
+                        .then(|| crate::capture::read_back(&self.device, list, &back))
+                        .flatten();
+                    let probe = crate::capture::probe(&self.device, list, &back);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    (capture, probe)
+                };
+                #[cfg(not(feature = "diagnostics"))]
+                let (capture, probe) = {
+                    let _ = frame;
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_RENDER_TARGET,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    (None::<()>, None::<()>)
+                };
+                crate::fpsbox::draw(self, list, &back, (width, height, format));
+                list.ResourceBarrier(&[transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)]);
+                if !after.is_empty() {
+                    list.ResourceBarrier(&after);
+                }
+                (capture, probe)
+            };
             copy.close();
             match slot {
-                Some(i) => {
-                    let flown = self.execute_own(copy);
-                    p.ahead[i].1 = flown;
-                }
+                Some(i) => { let flown = self.execute_own(copy); p.ahead[i].1 = flown; }
                 None => self.execute(&[copy]),
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
+                // Tests inspect the completed copy before flip-discard Present
+                // can invalidate the back buffer, with the presenter still locked.
+                #[cfg(test)]
+                inspect(&buffer, &footprint);
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
             let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
@@ -8377,7 +8831,10 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
             #[cfg(not(feature = "diagnostics"))]
-            Some(false)
+            {
+                let _ = (capture, probe);
+                Some(false)
+            }
         }
     }
 
@@ -8418,6 +8875,7 @@ impl Host {
             Ok(Presenter {
                 swap_chain,
                 present_status: 0,
+                compositor: None,
                 width,
                 height,
                 format,
@@ -9412,5 +9870,233 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod present_compositor_manual_tests {
+    use super::*;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    fn selected_host() -> &'static Host {
+        assert!(std::env::var_os("VICTORY_PRESENT_GPU_TESTS").is_some_and(|v| v == "1"),
+            "manual only: set VICTORY_PRESENT_GPU_TESTS=1 and explicitly select WARP or an adapter");
+        let warp = std::env::var_os("VICTORY_D3D12_WARP").is_some_and(|v| v == "1");
+        let named = std::env::var("VICTORY_D3D12_ADAPTER").is_ok_and(|v| !v.trim().is_empty());
+        assert!(warp || named, "select VICTORY_D3D12_WARP=1 or VICTORY_D3D12_ADAPTER before device creation");
+        let host = host().expect("explicitly selected test device");
+        // SAFETY: metadata of the adapter that actually owns this device.
+        let desc = unsafe { host.adapter.as_ref().expect("test adapter metadata").GetDesc1() }.unwrap();
+        let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+        let name = String::from_utf16_lossy(&desc.Description[..end]);
+        let software = desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0;
+        assert_eq!(software, warp, "unexpected software/hardware test adapter: {name}");
+        if !warp {
+            assert_eq!(name, std::env::var("VICTORY_D3D12_ADAPTER").unwrap());
+        }
+        eprintln!("PresentX test adapter: {name}, software={software}");
+        host
+    }
+
+    fn plane(host: &Host, list: &HostList, width: u64, height: u32, color: &[f32; 4]) -> ID3D12Resource {
+        let mut texture = None;
+        // SAFETY: synthetic texture, valid descriptors, live device and open list.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: width, Height: height,
+                    DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_RENDER_TARGET, None, &mut texture,
+            ).unwrap();
+            let texture = texture.unwrap();
+            list.list.ClearRenderTargetView(host.rtv(Some(&texture), None), color, None);
+            texture
+        }
+    }
+
+    fn corners(buffer: &ID3D12Resource, footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT) -> (u32, u32, [[u8; 4]; 4]) {
+        let (width, height) = (footprint.Footprint.Width, footprint.Footprint.Height);
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: present completed the readback before this callback; every
+        // sampled RGBA8 pixel is inside the footprint's rows.
+        unsafe {
+            buffer.Map(0, None, Some(&mut mapped)).unwrap();
+            let rgba = [(0, 0), (width - 1, 0), (0, height - 1), (width - 1, height - 1)].map(|(x, y)| {
+                mapped.cast::<u8>().add(footprint.Offset as usize + y as usize * footprint.Footprint.RowPitch as usize + x as usize * 4)
+                    .cast::<[u8; 4]>().read()
+            });
+            buffer.Unmap(0, None);
+            (width, height, rgba)
+        }
+    }
+
+    /// Manual: VICTORY_PRESENT_GPU_TESTS=1 plus WARP=1 (or an explicit adapter),
+    /// cargo test -p victory-gpu --features diagnostics present_compositor_manual -- --ignored --test-threads=1
+    #[test]
+    #[ignore = "manual synthetic GPU test: explicit device selection required"]
+    fn present_compositor_manual_scales_orders_blends_and_keeps_sources() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let host = selected_host();
+        let list = host.new_list().unwrap();
+        let scene = plane(host, &list, 2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        // Four different source corners make the scale check spatial, rather
+        // than only checking that a uniformly colored output was resized.
+        for (rect, color) in [
+            (RECT { left: 1, top: 0, right: 2, bottom: 1 }, [0.0, 1.0, 0.0, 1.0]),
+            (RECT { left: 0, top: 1, right: 1, bottom: 2 }, [0.0, 0.0, 1.0, 1.0]),
+            (RECT { left: 1, top: 1, right: 2, bottom: 2 }, [1.0, 1.0, 1.0, 1.0]),
+        ] {
+            // SAFETY: rectangles lie in the synthetic 2x2 target.
+            unsafe { list.list.ClearRenderTargetView(host.rtv(Some(&scene), None), &color, Some(&[rect])); }
+        }
+        let blue = plane(host, &list, 4, 4, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let green = plane(host, &list, 8, 8, &[0.0, 64.0 / 255.0, 0.0, 64.0 / 255.0]);
+        list.close();
+        host.execute(&[&list]);
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        // Own clones survive the original handles, as queue::present must.
+        let owned = [scene.clone(), blue.clone(), green.clone()];
+        let identities = owned.each_ref().map(|r| r.as_raw());
+        drop((scene, blue, green));
+        let sources = owned.each_ref().map(|r| (r, state));
+        let mut actual = None;
+        assert!(host.present_with_compositor(&sources, 1, Compositor::new,
+            |buffer, footprint| actual = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(actual, Some((8, 8, [[95, 64, 96, 255], [0, 159, 96, 255], [0, 64, 191, 255], [95, 159, 191, 255]])));
+        assert_eq!(owned.each_ref().map(|r| r.as_raw()), identities, "presentation keeps the original sources");
+
+        let mut reversed = None;
+        assert!(host.present_with_compositor(&[sources[0], sources[2], sources[1]], 2, Compositor::new,
+            |buffer, footprint| reversed = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(reversed.unwrap().2[0], [95, 32, 128, 255], "later overlays blend last");
+
+        // A repeated source is one native resource: transition/restore it once.
+        let mut repeated = None;
+        assert!(host.present_with_compositor(&[sources[0], sources[0]], 3, Compositor::new,
+            |buffer, footprint| repeated = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(repeated, Some((2, 2, [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255], [255, 255, 255, 255]])));
+        // An unchanged subsequent read also checks that presentation did not
+        // write or replace the source while producing its composed back buffer.
+        let mut unchanged = None;
+        assert!(host.present_with_compositor(&sources[..1], 4, Compositor::new,
+            |buffer, footprint| unchanged = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(unchanged, repeated);
+        // SAFETY: plain query on the explicitly selected device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    #[ignore = "manual synthetic GPU test: explicit device selection required"]
+    fn present_compositor_manual_deny_source_falls_back_then_valid_sources_retry() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let host = selected_host();
+        let list = host.new_list().unwrap();
+        let scene = plane(host, &list, 2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let valid_overlay = plane(host, &list, 4, 4, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        let mut denied = None;
+        // SAFETY: a valid depth-only resource; it must never reach SRV creation.
+        unsafe {
+            let mut desc = valid_overlay.GetDesc();
+            desc.Format = DXGI_FORMAT_D32_FLOAT;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+            host.device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, None, &mut denied,
+            ).unwrap();
+        }
+        let denied: ID3D12Resource = denied.unwrap();
+        list.close(); host.execute(&[&list]);
+        if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { p.compositor = None; }
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let denied_state = D3D12_RESOURCE_STATE_DEPTH_WRITE.0 as u32;
+        let mut fallback = None;
+        assert!(host.present_with_compositor(&[(&scene, state), (&denied, denied_state)], 1,
+            |_, _| panic!("unsupported source must be rejected before compositor/SRV creation"),
+            |buffer, footprint| fallback = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(fallback, Some((2, 2, [[255, 0, 0, 255]; 4])));
+        let mut composed = None;
+        assert!(host.present_with_compositor(&[(&scene, state), (&valid_overlay, state)], 2, Compositor::new,
+            |buffer, footprint| composed = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(composed, Some((4, 4, [[127, 0, 128, 255]; 4])), "valid later inputs must recover composition");
+        // Eligibility must be checked again even with a compositor cached.
+        let mut cached_fallback = None;
+        assert!(host.present_with_compositor(&[(&scene, state), (&denied, denied_state)], 3, Compositor::new,
+            |buffer, footprint| cached_fallback = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(cached_fallback, fallback);
+        // SAFETY: plain query on the explicitly selected test device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    #[ignore = "manual synthetic GPU test: explicit device selection required"]
+    fn present_compositor_manual_failure_keeps_primary_and_retries() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let host = selected_host();
+        let list = host.new_list().unwrap();
+        let scene = plane(host, &list, 2, 2, &[1.0, 0.0, 0.0, 1.0]);
+        let overlay = plane(host, &list, 4, 4, &[0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0]);
+        list.close(); host.execute(&[&list]);
+        // Another explicitly run test may already have populated this cache.
+        if let Some(p) = host.presenter.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { p.compositor = None; }
+        let state = D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32;
+        let sources = [(&scene, state), (&overlay, state)];
+        let mut attempted = false;
+        let mut fallback = None;
+        assert!(host.present_with_compositor(&sources, 1, |_, _| {
+            attempted = true;
+            Err(windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))
+        }, |buffer, footprint| fallback = Some(corners(buffer, footprint))).is_some());
+        assert!(attempted);
+        assert_eq!(fallback, Some((2, 2, [[255, 0, 0, 255]; 4])), "same failing frame still presents its primary");
+        let mut recovered = None;
+        assert!(host.present_with_compositor(&sources, 2, Compositor::new,
+            |buffer, footprint| recovered = Some(corners(buffer, footprint))).is_some());
+        assert_eq!(recovered, Some((4, 4, [[127, 0, 128, 255]; 4])), "next present retries and includes the overlay");
+        // SAFETY: plain query on the explicitly selected device.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+}
+
+
+#[cfg(test)]
+mod present_source_eligibility_tests {
+    use super::*;
+
+    #[test]
+    fn present_srv_keeps_typed_color_and_rejects_unsampleable_sources() {
+        let mut desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 4, Height: 4,
+            DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, ..Default::default()
+        };
+        for format in [DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_SNORM, DXGI_FORMAT_R16G16B16A16_UNORM] {
+            desc.Format = format;
+            assert_eq!(present_plane_srv_format(&desc), Some(format), "a typed SRV must not become the swapchain format");
+        }
+        desc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        assert_eq!(present_plane_srv_format(&desc), Some(DXGI_FORMAT_R8G8B8A8_UNORM));
+        for format in [DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_D32_FLOAT] {
+            desc.Format = format;
+            assert_eq!(present_plane_srv_format(&desc), None);
+        }
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.Flags = D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+        assert_eq!(present_plane_srv_format(&desc), None);
+        desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+        desc.SampleDesc.Count = 2;
+        assert_eq!(present_plane_srv_format(&desc), None);
+        desc.SampleDesc.Count = 1;
+        desc.DepthOrArraySize = 2;
+        assert_eq!(present_plane_srv_format(&desc), None);
+        desc.DepthOrArraySize = 1;
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        assert_eq!(present_plane_srv_format(&desc), None);
     }
 }
