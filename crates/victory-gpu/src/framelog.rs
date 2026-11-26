@@ -105,6 +105,8 @@ pub enum T {
     ScatterAllClearRequests, ScatterAllClearItems,
     UnmapMultiViewRequests, UnmapMultiViewCount,
     UnmapWholeViewRequests, UnmapWholeViewCount,
+    ParallelUnmapRequests, ParallelUnmapViews, ParallelUnmapWallUs,
+    ParallelUnmapFailures, ParallelUnmapSpawnFallbacks, ParallelUnmapPanics,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -687,6 +689,11 @@ pub fn frame() {
         t(T::AliasClearCalls), t(T::AliasClearPages), t(T::ScatterRequests), t(T::ScatterRequestedItems),
         t(T::ScatterAllClearRequests), t(T::ScatterAllClearItems),
         t(T::UnmapMultiViewRequests), t(T::UnmapMultiViewCount), t(T::UnmapWholeViewRequests), t(T::UnmapWholeViewCount),
+    );
+    tracing::info!(
+        "physical parallel unmap totals: requests {} views {} wall us {} native failures {} spawn fallbacks {} panicked chunks {}",
+        t(T::ParallelUnmapRequests), t(T::ParallelUnmapViews), t(T::ParallelUnmapWallUs),
+        t(T::ParallelUnmapFailures), t(T::ParallelUnmapSpawnFallbacks), t(T::ParallelUnmapPanics),
     );
 }
 

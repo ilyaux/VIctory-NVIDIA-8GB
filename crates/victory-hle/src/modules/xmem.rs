@@ -32,6 +32,7 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 mod diagnostics;
+mod unmap_parallel;
 use diagnostics::{Origin, measured};
 use victory_gpu::framelog::{self, T};
 
@@ -1049,6 +1050,71 @@ fn commit_limit_message(
     message
 }
 
+/// Detaches exactly one tracked view, preserving its section until its caller
+/// has finished native unmapping. Caller holds PHYSICAL and the remapping guard.
+fn remove_view(physical: &mut Physical, at: usize) -> Option<(usize, Slice)> {
+    let removed = measured(T::PhysicalRemovalUs, || {
+        let (size, slice) = physical.views.remove(&at)?;
+        for k in 0..size.div_ceil(PAGE) {
+            let key = slice.key(k);
+            if let Some(addresses) = physical.shown.get_mut(&key) {
+                addresses.retain(|&a| a != at + k * PAGE);
+                if addresses.is_empty() { physical.shown.remove(&key); }
+            }
+        }
+        Some((size, slice))
+    });
+    if let Some((size, _)) = &removed {
+        measured(T::PhysicalNotifyUs, || victory_gpu::title_memory_remapped(at, *size));
+    }
+    removed
+}
+
+fn unmap_native(at: usize, size: usize) -> bool {
+    framelog::add(T::PhysicalUnmapCalls, 1);
+    framelog::add(T::PhysicalUnmapBytes, size as u64);
+    // SAFETY: caller owns this mapped view; it becomes a placeholder again.
+    measured(T::PhysicalNativeUnmapUs, || unsafe {
+        UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }, MEM_PRESERVE_PLACEHOLDER)
+    }) != 0
+}
+
+/// Only complete old views, with no surviving tails. Metadata and notifications
+/// remain serial under the caller's locks; workers only perform native unmaps.
+fn unmap_whole_views(
+    physical: &mut Physical, base: usize, end: usize, views: &[(usize, usize)],
+    make: impl Fn(usize, usize) -> bool + Sync,
+) -> Option<unmap_parallel::Outcome> {
+    if !unmap_parallel::qualifies(views, base, end)
+        || views.iter().any(|(at, size)| physical.views.get(at).is_none_or(|v| v.0 != *size)) {
+        return None;
+    }
+    let mut retained = Vec::with_capacity(views.len());
+    for &(at, _) in views {
+        if let Some((size, slice)) = remove_view(physical, at) { retained.push((at, size, slice)); }
+    }
+    let targets: Vec<_> = retained.iter().map(|(at, size, _)| (*at, *size)).collect();
+    framelog::add(T::ParallelUnmapRequests, 1);
+    framelog::add(T::ParallelUnmapViews, targets.len() as u64);
+    let outcome = measured(T::ParallelUnmapWallUs, || unmap_parallel::run(&targets, make));
+    // A NO_WAIT kernel reader can re-arm a guard while old views still exist.
+    // Invalidate that observation after every native call has completed too,
+    // before a subsequent map or release of the remapping write guard.
+    for &(at, size) in &targets {
+        measured(T::PhysicalNotifyUs, || victory_gpu::title_memory_remapped(at, size));
+    }
+    framelog::add(T::ParallelUnmapFailures, outcome.failures as u64);
+    framelog::add(T::ParallelUnmapSpawnFallbacks, outcome.spawn_failures as u64);
+    framelog::add(T::ParallelUnmapPanics, outcome.panicked_chunks as u64);
+    if outcome.failures != 0 || outcome.panicked_chunks != 0 {
+        tracing::error!(failures = outcome.failures, panicked_chunks = outcome.panicked_chunks,
+            "parallel physical unmap failed");
+    }
+    // Keep every section alive until all scoped workers have joined.
+    drop(retained);
+    Some(outcome)
+}
+
 /// Returns `[base, base + len)` to placeholders; views reaching past it
 /// are mapped again outside it.
 fn unmap(physical: &mut Physical, base: usize, len: usize) {
@@ -1082,33 +1148,14 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             framelog::add(T::UnmapWholeViewCount, hit.len() as u64);
         }
     }
+    if unmap_parallel::enabled() && (4..=4096).contains(&hit.len()) {
+        let views: Vec<_> = hit.iter().filter_map(|at| physical.views.get(at).map(|v| (*at, v.0))).collect();
+        if unmap_whole_views(physical, base, end, &views, unmap_native).is_some() { return; }
+    }
     for at in hit {
-        let Some((size, slice)) = measured(T::PhysicalRemovalUs, || {
-            let (size, slice) = physical.views.remove(&at)?;
-            for k in 0..size.div_ceil(PAGE) {
-                let key = slice.key(k);
-                if let Some(addresses) = physical.shown.get_mut(&key) {
-                    addresses.retain(|&a| a != at + k * PAGE);
-                    if addresses.is_empty() {
-                        physical.shown.remove(&key);
-                    }
-                }
-            }
-            Some((size, slice))
-        }) else { continue; };
-        measured(T::PhysicalNotifyUs, || victory_gpu::title_memory_remapped(at, size));
-        victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalUnmapCalls, 1);
-        framelog::add(T::PhysicalUnmapBytes, size as u64);
-        // SAFETY: a view we mapped; it becomes a placeholder again.
-        measured(T::PhysicalNativeUnmapUs, || unsafe {
-            UnmapViewOfFile2(
-                GetCurrentProcess(),
-                MEMORY_MAPPED_VIEW_ADDRESS {
-                    Value: at as *mut c_void,
-                },
-                MEM_PRESERVE_PLACEHOLDER,
-            )
-        });
+        let Some((size, slice)) = remove_view(physical, at) else { continue; };
+        // Preserve the existing ignored native failure contract on this path.
+        unmap_native(at, size);
         if at < base {
             victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalTailPages, ((base - at) / PAGE) as u64);
             map_from(physical, at, base - at, slice.clone(), Origin::Tail);

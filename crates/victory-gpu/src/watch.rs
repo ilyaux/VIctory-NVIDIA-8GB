@@ -1628,6 +1628,122 @@ mod tests {
     }
 
     #[test]
+    fn a_post_unmap_note_invalidates_a_guard_even_when_old_cache_commit_is_late() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS,
+            MapViewOfFile3, PAGE_NOACCESS, SEC_RESERVE, UnmapViewOfFile2, VirtualAlloc2,
+            VirtualQuery,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        struct OwnedView { section: HANDLE, at: usize, mapped: bool }
+        impl Drop for OwnedView {
+            fn drop(&mut self) {
+                let mut cleaned = true;
+                if self.at != 0 {
+                    title_memory_remapped(self.at, BLOCK);
+                    // SAFETY: only this fixture's live view or retained placeholder.
+                    let unmapped = !self.mapped || unsafe {
+                        UnmapViewOfFile2(GetCurrentProcess(), MEMORY_MAPPED_VIEW_ADDRESS {
+                            Value: self.at as *mut _,
+                        }, MEM_PRESERVE_PLACEHOLDER)
+                    } != 0;
+                    // This fixture releases its VA, unlike the runtime's stable
+                    // placeholder pools. Forget only its journal/view-kind entries
+                    // before another test can allocate the same address.
+                    {
+                        let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+                        let pages: Vec<_> = j.written.range(self.at / PAGE..(self.at + BLOCK) / PAGE)
+                            .map(|(&page, _)| page).collect();
+                        for page in pages { j.written.remove(&page); }
+                    }
+                    guards().viewed.remove(&(self.at / BLOCK));
+                    cleaned = unmapped && unsafe { VirtualFree(self.at as _, 0, MEM_RELEASE) } != 0;
+                }
+                // SAFETY: this fixture's section handle; views keep their own reference.
+                cleaned &= unsafe { CloseHandle(self.section) } != 0;
+                if !std::thread::panicking() { assert!(cleaned, "owned fixture cleanup failed"); }
+            }
+        }
+
+        let _changing = title_memory_remapping();
+        // SAFETY: a fresh, unnamed section and placeholder, exclusively owned here.
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(),
+                PAGE_READWRITE | SEC_RESERVE, 0, BLOCK as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        let mut owned = OwnedView { section, at: 0, mapped: false };
+        owned.at = unsafe {
+            VirtualAlloc2(GetCurrentProcess(), std::ptr::null(), BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        } as usize;
+        assert_ne!(owned.at, 0);
+        let view = unsafe {
+            MapViewOfFile3(section, GetCurrentProcess(), owned.at as _, 0, BLOCK,
+                MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, std::ptr::null_mut(), 0)
+        };
+        assert_eq!(view.Value as usize, owned.at);
+        owned.mapped = true;
+        assert_eq!(unsafe {
+            VirtualAlloc(owned.at as _, BLOCK, MEM_COMMIT, PAGE_READWRITE)
+        } as usize, owned.at);
+        unsafe { (owned.at as *mut u8).write_bytes(0xa6, 8) };
+        crate::inplace::title_memory_view(owned.at, BLOCK, section as usize, 0);
+
+        // Deterministically schedule a NO_WAIT reader after the pre-note, while
+        // the old native view is still present. It can re-arm without MAPPING.
+        title_memory_remapped(owned.at, BLOCK);
+        let (old_asked, _) = writes(owned.at, owned.at + BLOCK, true).expect("old view is guarded");
+        let mut pending_bytes = [0u8; 8];
+        let mut done = 0;
+        assert_ne!(unsafe {
+            ReadProcessMemory(GetCurrentProcess(), owned.at as _, pending_bytes.as_mut_ptr().cast(),
+                pending_bytes.len(), &mut done)
+        }, 0);
+        assert_eq!(done, pending_bytes.len());
+        assert_eq!(pending_bytes, [0xa6; 8]);
+        assert!(guards().clean.contains(&(owned.at / BLOCK)));
+
+        assert_ne!(unsafe {
+            UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER)
+        }, 0);
+        owned.mapped = false;
+        // Native unmapping alone does not invalidate a re-armed cached guard.
+        assert!(guards().clean.contains(&(owned.at / BLOCK)));
+        title_memory_remapped(owned.at, BLOCK); // The production post-join note.
+        {
+            let g = guards();
+            assert!(!g.clean.contains(&(owned.at / BLOCK)));
+            assert!(!g.protected.contains(&(owned.at / BLOCK)));
+        }
+        // Model the old snapshot's hash/Last.asked being committed only after
+        // that post-note. No actual D3D staging resource is constructed here.
+        let cached = (old_asked, pending_bytes);
+        assert_eq!(cached.1, [0xa6; 8]);
+        match writes(owned.at, owned.at + BLOCK, true) {
+            Some((now, written)) => {
+                assert!(now > cached.0);
+                assert!(written.iter().any(|&(_, stamp)| stamp > cached.0),
+                    "the old asking must not certify this snapshot current");
+            }
+            None => {
+                // Hole-detection policy may decline tracking. That is absence,
+                // not a clean certificate; the address remains our placeholder.
+                // SAFETY: plain output storage; VirtualQuery fills the fields.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                assert_ne!(unsafe {
+                    VirtualQuery(owned.at as _, &mut info, std::mem::size_of_val(&info))
+                }, 0);
+                assert_eq!(info.State, MEM_RESERVE);
+            }
+        }
+    }
+
+    #[test]
     fn a_view_reset_and_guard_rearm_keep_protection_and_tracking_together() {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (section, one, two) = two_views(BLOCK);
