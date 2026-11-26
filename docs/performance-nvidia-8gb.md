@@ -1,11 +1,11 @@
-# RTX 5070 Laptop performance investigation
+# NVIDIA 8 GB performance investigation
 
-Target: stable 30 FPS in real gameplay on an RTX 5070 Laptop 8 GB,
-Ryzen AI 7 350 and 32 GB RAM. Menu FPS does not satisfy the target.
+Target: stable 30 FPS in real gameplay on an AMD CPU and an NVIDIA RTX
+50-series GPU with 8 GB VRAM. Menu FPS does not satisfy the target.
 
 ## 2026-11-26: first native baseline
 
-Build: `1e34f02`, Windows 11, driver 621.24, diagnostics profile, Series X.
+Build: `1e34f02`, diagnostics profile, Series X.
 Levels on demand enabled; mip reclamation disabled. A 100 Hz sampled profiler
 and the built-in frame logger were enabled. Test saves were copied from the
 user's data into an isolated directory. Game files, captures, caches and raw
@@ -95,7 +95,7 @@ this repo.
 
 ## Opt-in parallel hashing of card copies
 
-Branch `perf/rtx5070-card-hash` carries Martin Hartfelder's
+The parallel-hash experiment carries Martin Hartfelder's
 [64-thread card hash](https://github.com/fxceless/victory-fork/commit/55572246864888974da5bf8f418a092e73d66932),
 with the opt-in selection from fxceless's
 [6d20eed](https://github.com/fxceless/victory-fork/commit/6d20eed6ae8afe37c52f1911b46537b0ea8bcd0d).
@@ -119,7 +119,7 @@ each measured layer-work kind (20 control lines, 19 wide-hash lines):
 | Title GPU lists per usual frame | 73.0 ms | 57.1 ms |
 | Usual frame time | 175 ms | 152 ms |
 
-This supports reduced time in the layer's hash work on the RTX 5070. The scene
+This supports reduced time in the layer's hash work on the tested NVIDIA GPU. The scene
 progression and workloads differed, and the second run had warmer pipelines;
 the usual-frame logger excludes long frames. The table therefore does not
 establish an isolated full-frame speedup or sustained gameplay performance.
