@@ -9,6 +9,8 @@ use crate::native::{
 };
 use crate::{Container, ShaderError, io, resource, structure};
 
+mod masks;
+
 fn opcode(encoding: Encoding, name: &str) -> u32 {
     (0..1024)
         .find(|&opcode| Instruction { offset: 0, encoding, opcode, words: Vec::new() }.name() == Some(name))
@@ -206,6 +208,39 @@ fn global_wait_program() -> NativeProgram {
     native
 }
 
+/// A scalar four-iteration loop whose conditional exit is at its header.
+/// Only lane32 increments LDS; the plain latch and postloop read are collective.
+fn plain_loop_program(iterations: u8) -> NativeProgram {
+    let mut c = Code::default();
+    c.put([sop1("s_mov_b32", 5, 128), 0x3d << 26 | 0x02 << 18 | 8 << 6 | 2, 125 << 25]);
+    c.put([mov(1, 128), mov(2, 128), sop1("s_mov_b32", 24, 128)]);
+    c.put([cmp("v_cmp_eq_u32", 128, 0), sop1("s_and_saveexec_b64", 16, 106)]);
+    c.branch(0xbf88_0000, "init_done");
+    c.put(ds("ds_write_b32", 0, 0));
+    c.label("init_done");
+    c.put([sop1("s_mov_b64", 126, 16)]);
+    c.label("header");
+    assert!(iterations <= 64);
+    c.put([0xbf00_0000 | opcode(Encoding::Sopc, "s_cmp_ge_i32") << 16 | (128 + u32::from(iterations)) << 8 | 24]);
+    c.branch(0xbf85_0000, "done");
+    c.put([cmp("v_cmp_eq_u32", 160, 0), sop1("s_and_saveexec_b64", 18, 106)]);
+    c.branch(0xbf88_0000, "step");
+    c.put([mov(2, 129)]);
+    c.put(ds("ds_add_rtn_u32", 0, 3));
+    c.label("step");
+    c.put([sop1("s_mov_b64", 126, 18),
+        0x8000_0000 | opcode(Encoding::Sop2, "s_add_i32") << 23 | 24 << 16 | 129 << 8 | 24]);
+    c.branch(0xbf82_0000, "header");
+    c.label("done");
+    c.put(ds("ds_read_b32", 0, 6));
+    c.put([vop2("v_lshlrev_b32", 7, 130, 0)]);
+    c.put(buffer("buffer_store_dword", 6, false));
+    c.put([0xbf81_0000]);
+    let mut native = allocator_program();
+    native.code = c.finish();
+    native
+}
+
 fn empty_container() -> Container<'static> { Container { digest: [0; 16], version: (1, 0), parts: Vec::new() } }
 
 fn phase_shader(native: &NativeProgram) -> Result<HostShader, ShaderError> {
@@ -283,6 +318,12 @@ fn source_waits_keep_global_memory_order_in_validated_wave32() {
     if let Some(path) = std::env::var_os("VICTORY_LDS_SYNTHETIC_OUT") {
         std::fs::write(path, &shader.dxil).unwrap();
     }
+}
+
+#[test]
+fn a_collective_plain_latch_with_a_source_exit_validates() {
+    let mut shader = phase_shader(&plain_loop_program(4)).expect("finite collective plain latch");
+    validate(&mut shader);
 }
 
 #[test]
@@ -446,6 +487,9 @@ fn allocator_phase_manual_preserves_objects_on_explicit_device() {
     validate(&mut bounded);
     let mut global = phase_shader(&global_wait_program()).expect("global source waits before device creation");
     validate(&mut global);
+    let mut loops = [4, 32].map(|n| phase_shader(&plain_loop_program(n))
+        .expect("collective plain latch before device creation"));
+    for shader in &mut loops { validate(shader); }
     let mut exits: Vec<_> = [EarlyExit::Direct, EarlyExit::Stub, EarlyExit::Repeated, EarlyExit::RawVccNz, EarlyExit::RawVccZ].into_iter().map(|exit|
         phase_shader(&allocator_variant(false, Some(exit))).expect("collective exit before device creation")).collect();
     for shader in &mut exits { validate(shader); }
@@ -473,5 +517,16 @@ fn allocator_phase_manual_preserves_objects_on_explicit_device() {
         let expected: Vec<_> = (0..64).map(|i| if i == 0 { 42 } else { 0 }).collect();
         assert_eq!(out, [expected], "invocation0 must see invocation32's marker after the source wait");
     }
-    eprintln!("Wave32 strict phases: 16 allocation +16 native-bounds +40 collective-exit/raw-VCC +8 global-wait completed readbacks PASS");
+    for (shader, expected) in loops.iter().zip([4, 0]) {
+        use super::host::{Dispatch, Root, View};
+        let (root, pipeline) = host.compute_pipeline(shader).unwrap();
+        for _ in 0..8 {
+            let out = host.dispatch(&root, &pipeline, &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]))],
+                views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
+            }).unwrap();
+            assert_eq!(out, [vec![expected; 64]], "finite loop or collective loop-limit exit, all invocations");
+        }
+    }
+    eprintln!("Wave32 strict phases: 16 allocation +16 native-bounds +40 collective-exit/raw-VCC +8 global-wait +16 plain-loop completed readbacks PASS");
 }

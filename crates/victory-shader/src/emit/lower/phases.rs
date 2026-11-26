@@ -43,22 +43,24 @@ pub(super) fn strict_breach(why: Why) {
     }
 }
 
-/// The class of [`with_strict_phases`] (`crate::emit::try_lds_phases`): a program with no cross-lane
-/// code of its own (lane reads and writes, `v_mbcnt`, permutes, swizzles, DPP, quad masks,
-/// lane masks read as numbers, constant or opaque lane masks), so the only exchange between
-/// the two host waves is the one wave-wide branches add; with one end and no indirect jump.
+/// The class of [`with_strict_phases`] (`crate::emit::try_lds_phases`): mask counts, prefixes
+/// and first-lane reads use the existing cross-half exchange under the same convergence audit.
+/// Other lane reads and writes, permutes, swizzles, DPP, quad masks, other mask-as-data uses,
+/// constant or opaque lane masks stay excluded; with one end and no indirect jump.
 pub(in crate::emit) fn phase_class(p: &Program, st: &Structured) -> Result<(), Why> {
     let cross = p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
         let n = i.name();
+        let mask_count = matches!(n, "s_bcnt1_i32_b64" | "s_ff1_i32_b64"
+            | "v_mbcnt_lo_u32_b32" | "v_mbcnt_hi_u32_b32");
         n.starts_with("ds_swizzle")
             || n.contains("permute")
-            || n.starts_with("v_mbcnt")
-            || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32")
+            || (n.starts_with("v_mbcnt") && !mask_count)
+            || matches!(n, "v_readlane_b32" | "v_writelane_b32")
             || n.starts_with("s_wqm")
             || n.starts_with("s_quadmask")
             || matches!(n, "s_memtime" | "s_memrealtime" | "s_getreg_b32")
             || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
-            || reads_mask_as_data(st, i)
+            || (reads_mask_as_data(st, i) && !mask_count)
     });
     if cross || lane_constant_masks(st) {
         return Err("cross-lane or timing-sensitive code in a strict LDS phase program");
@@ -71,8 +73,8 @@ pub(in crate::emit) fn phase_class(p: &Program, st: &Structured) -> Result<(), W
 }
 
 /// The loops of the strict LDS phase contract, on the structure `st` the program was lowered
-/// with and the IR blocks `barriers` that lowering put barriers in: no loop closed by a plain
-/// jump (a thread at the iteration limit leaves the program, `abort_block`), no irreducible
+/// with and the IR blocks `barriers` that lowering put barriers in: a plain backedge must have
+/// collective header/latch entry and a source exit, no irreducible
 /// loop, no lane leaving for an end block alone; and every loop that holds a barrier is
 /// entered from a block every lane runs and has only wave-wide or uniform branches in it, no
 /// end. Every thread then runs each iteration, meets each barrier of it, counts the same
@@ -121,11 +123,19 @@ pub(in crate::emit) fn phase_loops(p: &Program, st: &Structured, barriers: &[usi
     }
     for b in (0..n).filter(|&b| rpo[b] != usize::MAX) {
         for t in succ(b).into_iter().filter(|&t| rpo[t] <= rpo[b]) {
-            if matches!(st.exits[b], LaneExit::Jump(_)) {
-                return Err("a loop closed by a plain jump in a strict LDS phase program");
-            }
             if !dominates(t, b) {
                 return Err("an irreducible loop in a strict LDS phase program");
+            }
+            let plain = matches!(st.exits[b], LaneExit::Jump(_));
+            // A plain latch's loop-limit Ret must leave the whole group together,
+            // including when only the code after the loop contains barriers.
+            if plain && (!all[t] || !all[b]) {
+                return Err("a plain loop backedge not every thread reaches together");
+            }
+            // One natural body suffices for the source-exit proof below only
+            // when this header has one latch.
+            if plain && preds[t].iter().filter(|&&q| rpo[t] <= rpo[q]).count() != 1 {
+                return Err("a plain loop backedge with several latches");
             }
             // the loop of this back edge: what reaches `b` without passing its header `t`
             let mut body = vec![false; n];
@@ -135,6 +145,9 @@ pub(in crate::emit) fn phase_loops(p: &Program, st: &Structured, barriers: &[usi
                 if !std::mem::replace(&mut body[x], true) {
                     stack.extend(preds[x].iter().copied());
                 }
+            }
+            if plain && !(0..n).any(|x| body[x] && succ(x).into_iter().any(|y| !body[y])) {
+                return Err("a plain loop backedge without a source exit");
             }
             if !barriers.iter().any(|&x| body.get(x).copied().unwrap_or(false)) {
                 continue;
@@ -186,11 +199,21 @@ impl super::Lower<'_> {
             }
             return;
         }
-        let every = all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false));
-        if block != self.cur || self.guard_depth != 0 || !every {
+        // Saved mask ballots are inserted at their producer's completed tail,
+        // after its lane guards rejoined, rather than at the later consumer.
+        let ir = if block == self.cur && self.guard_depth == 0 {
+            Some(self.cur_ir)
+        } else if block != self.cur {
+            self.tail.iter().position(|&tail| tail == Some(block))
+        } else {
+            None
+        };
+        let every = ir.is_some_and(|b| all_lane_blocks(self.x.st)
+            .is_some_and(|all| all.get(b).copied().unwrap_or(false)));
+        if !every {
             return strict_breach("a phase barrier not every thread of the group reaches together");
         }
-        let b = self.cur_ir;
+        let b = ir.expect("audited current block or completed producer tail");
         STRICT_BARRIERS.with_borrow_mut(|v| {
             if !v.contains(&b) {
                 v.push(b);

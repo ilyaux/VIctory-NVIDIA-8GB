@@ -6,13 +6,22 @@ still requires Wave64 on a Wave32 host. It is off by default. It keeps one
 collective scalar mask branches and a group barrier before each LDS access.
 
 The accepted class is deliberately narrow: exactly 64 threads, native LDS,
-one end, no indirect exits, and no original lane reads, permutes, DPP, mask
-values used as numbers, or other cross-lane instructions. Every original
+one end and no indirect exits. Mask bit counts, first-set-bit, low/high prefixes
+and first-active-lane reads use the existing exact cross-half exchange. Other
+lane reads and writes, permutes, DPP and mask-as-data consumers remain excluded,
+as do opaque and fixed lane masks. Every original
 mask branch is widened, including a condition simplified to a constant by its
 original incoming path. The final structure must contain no remaining
 lane-dependent branch. Every emitted barrier must be outside lane guards,
 in a block the whole group reaches; loop entry, exits and iteration limits
 are audited too. A failed audit returns to the existing retry paths.
+
+Saved mask ballots are evaluated at their producer, including a completed
+all-lane producer tail when the value is consumed later. The barrier audit
+records that producer block for the loop audit. A plain loop latch is accepted
+only with a dominating header, collective header and latch, a single latch and
+a source exit edge. The loop-limit return must therefore leave both host halves
+together; arbitrary or closed plain backedges remain refused.
 
 Scalar `s_waitcnt*` instructions conservatively finish memory requests for the
 whole source wave with an all-memory group fence. Partial and LGKM waits are
@@ -79,4 +88,43 @@ first failed because the ordinary IR had removed all three synthetic waits.
 With retention, SDK disassembly confirms three mode11 barriers at those points.
 The updated checks pass: 184 CPU tests, offline real-container validation with
 26 retained waits, and 80 explicit RTX readbacks including eight cross-half UAV
-store/wait/read checks. A repeat native run of this version is still required.
+store/wait/read checks.
+
+## Follow-up native trials
+
+The build with CBV validation and retained source waits completed a bounded
+native trial with over 90 seconds of qualified 3D frames on the explicit RTX
+adapter without a logged device error. This is limited stability evidence;
+it does not establish the cause of the first failure or general GPU safety.
+The experimental launcher now selects this build by hash, with phase lowering
+enabled, separate saves and a guard against a second concurrent instance.
+
+With the texture staging budget set to20 ms and DRED disabled, complete warm
+scene windows produced 182 frames in73.1 seconds (2.49 FPS). Frame-time median
+was195 ms and p95 was1089 ms. Texture staging median was50.1 ms and p95 was68.7 ms;
+the budget is not a hard frame-time limit. These settings and cache/scene state
+changed together, so this is not an isolated performance comparison. Faces and
+lighting remain visibly incorrect. Correct, controllable 30 FPS gameplay is
+still unverified.
+
+A separate20-second recording-thread profile found substantial descriptor-lock
+and physical-page mapping waits. Times summed over recording threads are not
+frame time saved by removing a wait. Its sampler also paused threads for up to
+44 ms, so the profiled window is not a frame-rate benchmark.
+
+## Mask and loop extension checks
+
+The extended candidate passes190 selected CPU regressions with5 manual checks
+ignored. GPU modules, three inline GPU tests and the rectangle test module were
+excluded explicitly. A second previously rejected external compute container
+now validates as WaveSize32 with21 retained waits, and the public emitter selects
+the same strict candidate. This is an offline compatibility result.
+
+On the named RTX5070 adapter,224 full-buffer synthetic readbacks pass:96 cover
+allocation, native LDS bounds, collective exits, source memory waits and plain
+loop completion/collective loop-limit return;128 cover mask counts, first-set-bit,
+prefixes and atomic-return broadcast in64x1 and8x8 groups. The latter include an
+upper-half-only EXEC set, a saved mask consumed after EXEC changes, its complement
+and a joined mask. Opaque/fixed masks and multiple-source-wave groups still refuse.
+These checks do not establish the performance or rendering of the extended
+candidate in the game.
