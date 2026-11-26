@@ -778,34 +778,94 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     true
 }
 
+/// The queue's repeated-source mapping. The default path remains its original
+/// page-at-a-time loop; the optional batch handles exactly one complete old view.
+pub fn map_alias_repeated(to: u64, from: u64, len: u64) -> bool {
+    static BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *BATCH.get_or_init(|| std::env::var_os("VICTORY_REPEAT_BATCH").is_some_and(|v| v == "1"));
+    if len >= 2 * PAGE as u64 && (enabled || victory_gpu::framelog::on()) {
+        let mut p = physical();
+        if repeat_slices(&p, to as usize, from as usize, len as usize).is_some() {
+            victory_gpu::framelog::add(victory_gpu::framelog::T::RepeatPotentialPages, len / PAGE as u64);
+            if enabled {
+                let _changing = victory_gpu::title_memory_remapping();
+                if let Some(result) = repeat_alias_batch(&mut p, to as usize, from as usize, len as usize, map) {
+                    return result;
+                }
+            }
+        }
+    }
+    (0..len).step_by(PAGE).all(|k| map_alias(to + k, from, PAGE as u64))
+}
+
+fn repeat_slices(p: &Physical, to: usize, from: usize, len: usize) -> Option<(Slice, Slice)> {
+    if len < 2 * PAGE || from == 0 || (to | from | len) & (PAGE - 1) != 0 { return None; }
+    let (end, source_end) = (to.checked_add(len)?, from.checked_add(PAGE)?);
+    if to < source_end && from < end { return None; }
+    let (size, old) = p.views.get(&to)?;
+    if *size != len { return None; }
+    let (&base, (bytes, source)) = p.views.range(..=from).next_back()?;
+    if from - base >= *bytes || PAGE > bytes - (from - base) { return None; }
+    Some((old.clone(), Slice { index: source.index.checked_add((from - base) / PAGE)?, section: source.section.clone() }))
+}
+
+/// The first legacy page replacement already unmaps this entire old view,
+/// discarding any COW in it. On failure, restore only the untouched old suffix.
+/// `make` is the production mapper; CPU tests inject one failure at this boundary.
+fn repeat_alias_batch(
+    p: &mut Physical, to: usize, from: usize, len: usize,
+    mut make: impl FnMut(&mut Physical, usize, usize, Slice) -> bool,
+) -> Option<bool> {
+    let (old, source) = repeat_slices(p, to, from, len)?;
+    victory_gpu::framelog::add(victory_gpu::framelog::T::RepeatBatchPages, (len / PAGE) as u64);
+    unmap(p, to, len);
+    for k in (0..len).step_by(PAGE) {
+        if !make(p, to + k, PAGE, source.clone()) {
+            let next = k + PAGE;
+            if next < len && !make(p, to + next, len - next,
+                Slice { index: old.index + next / PAGE, section: old.section.clone() }) {
+                victory_gpu::framelog::add(victory_gpu::framelog::T::RepeatRestoreFailures, 1);
+                tracing::error!(address = format_args!("{:#x}", to + next), bytes = len - next,
+                    "physical alias suffix restore failed");
+            }
+            tracing::warn!(address = format_args!("{:#x}", to + k), bytes = len,
+                "repeated physical page mapping failed");
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
 /// Retains only exact, resident shared aliases. Every miss takes the original
 /// unmap/map path, including after a partial protection reset. The caller holds
 /// both mapping locks; external concurrent VM mutations are unsupported, as in `map`.
 fn reuse_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    use victory_gpu::framelog::{T, add};
+    let miss = |reason| { add(reason, 1); false };
     if len == 0 || from == 0 || (to | from | len) & (PAGE - 1) != 0 {
-        return false;
+        return miss(T::AliasShapeMisses);
     }
-    let (Some(end), Some(source_end)) = (to.checked_add(len), from.checked_add(len)) else { return false };
-    if to < source_end && from < end { return false; }
+    let (Some(end), Some(source_end)) = (to.checked_add(len), from.checked_add(len)) else { return miss(T::AliasShapeMisses) };
+    if to < source_end && from < end { return miss(T::AliasShapeMisses); }
     for k in (0..len).step_by(PAGE) {
-        let Some((size, dest)) = physical.views.get(&(to + k)) else { return false };
+        let Some((size, dest)) = physical.views.get(&(to + k)) else { return miss(T::AliasShapeMisses) };
         let at = from + k;
         let Some((&base, (bytes, source))) = physical.views.range(..=at).next_back()
-            .filter(|&(base, (bytes, _))| at - *base < *bytes) else { return false };
-        if *size != PAGE || at - base + PAGE > *bytes
-            || !Arc::ptr_eq(&dest.section, &source.section)
+            .filter(|&(base, (bytes, _))| at - *base < *bytes) else { return miss(T::AliasBackingMisses) };
+        if *size != PAGE || at - base + PAGE > *bytes { return miss(T::AliasShapeMisses); }
+        if !Arc::ptr_eq(&dest.section, &source.section)
             || Some(dest.index) != source.index.checked_add((at - base) / PAGE) {
-            return false;
+            return miss(T::AliasBackingMisses);
         }
     }
     // End snapshots and in-place views, then atomically reset protection and
     // its guard metadata. Physical's identical reverse mappings remain.
     for at in (to..end).step_by(PAGE) {
-        if !victory_gpu::title_memory_reset_view(at, PAGE) { return false; }
+        if !victory_gpu::title_memory_reset_view(at, PAGE) { return miss(T::AliasResetMisses); }
     }
     // PAGE_READWRITE alone cannot undo an earlier private copy-on-write page.
     // Check every host page after reset; ordinary writes can no longer cause COW.
-    if !resident_shared(to, len) { return false; }
+    if !resident_shared(to, len) { return miss(T::AliasResidencyMisses); }
     for at in (to..end).step_by(PAGE) {
         let (_, slice) = &physical.views[&at];
         victory_gpu::title_memory_view(at, PAGE, slice.section.0 as usize, (slice.index * PAGE) as u64);
@@ -849,6 +909,7 @@ fn resident_shared(at: usize, len: usize) -> bool {
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
 /// must lie in one placeholder.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalMapCalls, 1);
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
@@ -979,6 +1040,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             }
         }
         victory_gpu::title_memory_remapped(at, size);
+        victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalUnmapCalls, 1);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
             UnmapViewOfFile2(
@@ -990,9 +1052,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             )
         };
         if at < base {
+            victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalTailPages, ((base - at) / PAGE) as u64);
             map(physical, at, base - at, slice.clone());
         }
         if at + size > end {
+            victory_gpu::framelog::add(victory_gpu::framelog::T::PhysicalTailPages, ((at + size - end) / PAGE) as u64);
             let index = slice.index + (end - at) / PAGE;
             map(physical, end, at + size - end, Slice { index, ..slice });
         }
@@ -1110,6 +1174,10 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 #[path = "xmem/alias_tests.rs"]
 mod alias_tests;
+
+#[cfg(test)]
+#[path = "xmem/repeat_tests.rs"]
+mod repeat_tests;
 
 #[cfg(test)]
 mod tests {

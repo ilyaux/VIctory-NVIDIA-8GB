@@ -9,45 +9,50 @@ use windows_sys::Win32::System::Memory::{
 const MEM_COALESCE_PLACEHOLDERS: u32 = 1; // winnt.h; grouped under SystemServices in windows-sys.
 
 const BYTES: usize = 2 * PAGE;
-const RESERVED: usize = BYTES + 2 * PAGE;
-
-struct Aliases {
-    pages: Vec<usize>,
-    reservations: Vec<usize>,
-    source: usize,
-    destination: usize,
+pub(super) struct Aliases {
+    pub(super) pages: Vec<usize>,
+    pub(super) reservations: Vec<usize>,
+    pub(super) source: usize,
+    pub(super) destination: usize,
 }
 
 impl Aliases {
     fn new(large_destination: bool) -> Self {
-        let mut a = Self { pages: allocate(2), reservations: Vec::new(), source: 0, destination: 0 };
+        Self::new_pages(2, large_destination)
+    }
+
+    pub(super) fn new_pages(count: usize, large_destination: bool) -> Self {
+        let mut a = Self { pages: allocate(count), reservations: Vec::new(), source: 0, destination: 0 };
+        let bytes = count * PAGE;
+        let reserved = bytes + 2 * PAGE;
         for _ in 0..2 {
-            let at = XMemVirtualAlloc(std::ptr::null_mut(), RESERVED, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), reserved, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
             assert!(!at.is_null());
             a.reservations.push(at as usize);
         }
         // Padding keeps shown_at runs distinct even for adjacent reservations.
         a.source = a.reservations[0] + PAGE;
         a.destination = a.reservations[1] + PAGE;
-        assert_eq!(XMemMapPhysicalPages(a.source as _, 2, a.pages.as_ptr()) as usize, a.source);
+        assert_eq!(XMemMapPhysicalPages(a.source as _, count, a.pages.as_ptr()) as usize, a.source);
         if large_destination {
-            assert_eq!(XMemMapPhysicalPages(a.destination as _, 2, a.pages.as_ptr()) as usize, a.destination);
+            assert_eq!(XMemMapPhysicalPages(a.destination as _, count, a.pages.as_ptr()) as usize, a.destination);
         } else {
-            assert!(map_alias(a.destination as u64, a.source as u64, BYTES as u64));
+            assert!(map_alias(a.destination as u64, a.source as u64, bytes as u64));
         }
         a
     }
 
     fn warm(&self) {
+        let bytes = self.pages.len() * PAGE;
         // SAFETY: both ranges are our committed aliases. Only the fixture faults
         // pages in; the production resident_shared query must never do that.
         unsafe {
-            (self.source as *mut u8).write_bytes(0x31, BYTES);
-            for offset in (0..BYTES).step_by(4096) {
+            (self.source as *mut u8).write_bytes(0x31, bytes);
+            for offset in (0..bytes).step_by(4096) {
                 assert_eq!(((self.destination + offset) as *const u8).read_volatile(), 0x31);
             }
         }
-        assert!(resident_shared(self.destination, BYTES), "fixture must actually be resident and shared");
+        assert!(resident_shared(self.destination, bytes), "fixture must actually be resident and shared");
     }
 
     fn apply(&self, to: usize, from: usize, bytes: usize) -> (bool, bool) {
@@ -65,15 +70,16 @@ impl Aliases {
 
 impl Drop for Aliases {
     fn drop(&mut self) {
+        let reserved = (self.pages.len() + 2) * PAGE;
         for &at in &self.reservations {
-            XMemMapPhysicalPages(at as _, RESERVED / PAGE, std::ptr::null());
+            XMemMapPhysicalPages(at as _, reserved / PAGE, std::ptr::null());
         }
         XMemFreePhysicalPages(self.pages.len(), self.pages.as_ptr());
         for &at in &self.reservations {
             // SAFETY: only this fixture's fully unmapped placeholder reservation.
             // Coalescing may fail harmlessly when it is already one placeholder.
             unsafe {
-                VirtualFree(at as _, RESERVED, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+                VirtualFree(at as _, reserved, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
                 VirtualFree(at as _, 0, MEM_RELEASE);
             }
         }

@@ -934,6 +934,7 @@ pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
 /// `(to, from, len)` (`from` 0 unmaps); false on failure.
 pub type PageMapper = fn(u64, u64, u64) -> bool;
 static PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
+static REPEATED_PAGE_MAPPER: std::sync::OnceLock<PageMapper> = std::sync::OnceLock::new();
 
 /// The runtime's page mapper, for the queues' page-mapping copies (memory
 /// is the runtime's, as on the console).
@@ -943,6 +944,16 @@ pub fn use_page_mapper(mapper: PageMapper) {
 
 pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
+}
+
+/// Maps the same source page repeatedly over a destination range. This is
+/// distinct from the consecutive-source-page mapper above.
+pub fn use_repeated_page_mapper(mapper: PageMapper) {
+    let _ = REPEATED_PAGE_MAPPER.set(mapper);
+}
+
+pub(crate) fn repeated_page_mapper() -> Option<PageMapper> {
+    REPEATED_PAGE_MAPPER.get().copied()
 }
 
 /// Allocation attributes for resource memory: allocator id, page size

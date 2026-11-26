@@ -1538,11 +1538,21 @@ extern "system" fn copy_page_mappings(
         let mut at = b.destination;
         for r in ranges {
             let len = u64::from(r.count) * PAGE;
+            let counter = match r.kind {
+                0 => Some(crate::framelog::T::PageContiguousPages),
+                1 => Some(crate::framelog::T::PageRepeatedPages),
+                2 => Some(crate::framelog::T::PageUnmappedPages),
+                _ => None,
+            };
+            if let Some(counter) = counter { crate::framelog::add(counter, u64::from(r.count)); }
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                1 if inside(1) => match crate::resource::repeated_page_mapper() {
+                    Some(repeated) => repeated(at, source, len),
+                    None => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
+                },
                 2 => map(at, 0, len),
                 3 => true,
                 _ => false,
