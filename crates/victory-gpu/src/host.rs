@@ -7912,6 +7912,7 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    present_status: i32,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -8360,7 +8361,18 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let status = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if status.0 != p.present_status {
+                p.present_status = status.0;
+                if status.is_err() {
+                    tracing::warn!(frame, status = format_args!("{:#010x}", status.0 as u32), "DXGI present failed");
+                } else {
+                    tracing::info!(frame, status = format_args!("{:#010x}", status.0 as u32), "DXGI present status changed");
+                }
+            }
+            if status.is_err() {
+                return None;
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8405,6 +8417,7 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                present_status: 0,
                 width,
                 height,
                 format,

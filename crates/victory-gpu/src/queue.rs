@@ -1372,7 +1372,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
             drawn,
             dispatches,
             dispatched,
-            "frame presented (since the last line: draws and dispatches, and those run on the host)"
+            "frame presentation requested (since the last line: draws and dispatches, and those run on the host)"
         );
         #[cfg(windows)]
         if frame >= 256 {

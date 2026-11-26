@@ -184,3 +184,18 @@ Forcing wave32 does not preserve the lane and shared-memory semantics of the
 failed shaders; forcing wave64 has a documented device-loss history. Neither
 switch is treated as a fix. Attribution of these paths to black faces is
 still open. Correct picture and stable 30 FPS remain unverified.
+
+The first exact-merge native attempt (run11) was stopped after about 58
+seconds when the user reported a black picture with audible title audio.
+Both run10 and run11 were still in their low-draw loading phase at that
+time, with zero changed runs uploaded under flights. Run10 first dispatched
+the upscaler at about 88 seconds. The changed gap setting was therefore not
+exercised in the observed interval; neither a visual improvement nor a
+gap-induced regression was established. No device-removal error was logged.
+
+The host previously ignored the DXGI `Present` result, so missing error logs
+could not establish successful presentation. It now logs nonzero status
+changes and recovery, and reports failed presents as not shown. The queue's
+periodic counter is labelled as presentation requests. This is diagnostic
+coverage, not a fix for the black picture; a targeted source-frame readback
+is still needed to distinguish empty rendering from a presentation failure.
