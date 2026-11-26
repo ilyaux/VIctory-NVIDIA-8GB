@@ -98,6 +98,13 @@ pub enum T {
     PhysicalNativeUnmapUs,
     PhysicalUnmapBytes,
     PhysicalUnmapEmptyCalls,
+    DirectClearCalls, DirectClearPages,
+    ScatterClearCalls, ScatterClearPages,
+    AliasClearCalls, AliasClearPages,
+    ScatterRequests, ScatterRequestedItems,
+    ScatterAllClearRequests, ScatterAllClearItems,
+    UnmapMultiViewRequests, UnmapMultiViewCount,
+    UnmapWholeViewRequests, UnmapWholeViewCount,
     /// Texture refreshes on every thread, and of them the wait for title
     /// memory to hold still; uploads recorded.
     RefreshUs,
@@ -672,6 +679,14 @@ pub fn frame() {
         t(T::PhysicalTailPages), t(T::RepeatPotentialPages), t(T::RepeatBatchPages), t(T::RepeatRestoreFailures),
         t(T::PhysicalSplitUs), t(T::PhysicalMapViewUs), t(T::PhysicalCommitUs), t(T::PhysicalNotifyUs),
         t(T::PhysicalViewUs), t(T::PhysicalBookkeepingUs), t(T::PhysicalRemovalUs), t(T::PhysicalNativeUnmapUs), t(T::PhysicalLockUs),
+    );
+    tracing::info!(
+        "physical clear totals: direct {}/{} scatter {}/{} alias {}/{} (calls/pages); scatter requests {}/{} all-clear {}/{} \
+         (calls/items); unmap multi-view {}/{} whole-view {}/{} (requests/views)",
+        t(T::DirectClearCalls), t(T::DirectClearPages), t(T::ScatterClearCalls), t(T::ScatterClearPages),
+        t(T::AliasClearCalls), t(T::AliasClearPages), t(T::ScatterRequests), t(T::ScatterRequestedItems),
+        t(T::ScatterAllClearRequests), t(T::ScatterAllClearItems),
+        t(T::UnmapMultiViewRequests), t(T::UnmapMultiViewCount), t(T::UnmapWholeViewRequests), t(T::UnmapWholeViewCount),
     );
 }
 

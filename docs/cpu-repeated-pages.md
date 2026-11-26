@@ -82,3 +82,17 @@ intervals with that boundary in mind. These timers sum wall time across threads,
 not critical-path time saved. Each individual duration is truncated to whole
 microseconds before addition: a zero phase total does not prove absence of work.
 When frame logging is off, no timing query runs.
+
+The cumulative `physical clear totals` line distinguishes direct, scatter and
+queue clear requests. Scatter request counts include attempted items; an
+all-clear group is counted only after every item succeeded. Multi-view unmap
+requests count removed tracked views, with a separate subset wholly inside the
+requested range (no partial tails). These are workload shapes, not a guarantee
+that reordering or parallel processing preserves an API's failure contract.
+
+In the first cumulative native recording, all tail/candidate/batch totals stayed
+zero. Over one 36.5-second warm interval, native mapping/unmapping took 97.5% of
+recorded non-lock phases, predominantly unmapping. A separate owned 32-MiB CPU
+fixture did not reproduce the millisecond game latency or improve with four
+Python/ctypes workers. That cold result does not determine in-process kernel
+behavior; no parallel mapping implementation is enabled by these diagnostics.

@@ -675,6 +675,17 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 fn map_physical(address: *mut c_void, n: usize, pages: *const usize, origin: Origin) -> *mut c_void {
+    if pages.is_null() {
+        let counters = match origin {
+            Origin::Direct => Some((T::DirectClearCalls, T::DirectClearPages)),
+            Origin::Scatter => Some((T::ScatterClearCalls, T::ScatterClearPages)),
+            _ => None,
+        };
+        if let Some((calls, volume)) = counters {
+            framelog::add(calls, 1);
+            framelog::add(volume, n as u64);
+        }
+    }
     let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
@@ -722,6 +733,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    framelog::add(T::ScatterRequests, 1);
+    framelog::add(T::ScatterRequestedItems, n as u64);
+    let mut cleared = 0;
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -734,9 +748,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
+        if page.is_null() { cleared += 1; }
         if map_physical(address, 1, page, Origin::Scatter).is_null() {
             return 0;
         }
+    }
+    if cleared == n && n != 0 {
+        framelog::add(T::ScatterAllClearRequests, 1);
+        framelog::add(T::ScatterAllClearItems, n as u64);
     }
     1
 }
@@ -748,6 +767,10 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
+    if from == 0 {
+        framelog::add(T::AliasClearCalls, 1);
+        framelog::add(T::AliasClearPages, (len / PAGE) as u64);
+    }
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
@@ -1050,6 +1073,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
             .collect()
     });
     if hit.is_empty() { framelog::add(T::PhysicalUnmapEmptyCalls, 1); }
+    if hit.len() > 1 {
+        framelog::add(T::UnmapMultiViewRequests, 1);
+        framelog::add(T::UnmapMultiViewCount, hit.len() as u64);
+        if hit.iter().all(|at| physical.views.get(at).is_some_and(|(size, _)|
+            *at >= base && at.checked_add(*size).is_some_and(|limit| limit <= end))) {
+            framelog::add(T::UnmapWholeViewRequests, 1);
+            framelog::add(T::UnmapWholeViewCount, hit.len() as u64);
+        }
+    }
     for at in hit {
         let Some((size, slice)) = measured(T::PhysicalRemovalUs, || {
             let (size, slice) = physical.views.remove(&at)?;
