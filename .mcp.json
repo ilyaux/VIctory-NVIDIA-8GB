@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "kanzo": {
+      "type": "stdio",
+      "command": "kanzo",
+      "args": ["mcp"]
+    }
+  }
+}

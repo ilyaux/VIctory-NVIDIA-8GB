@@ -212,8 +212,8 @@ texture and composition into a 3840x2160 UI target, while this fork presents
 only the first plane's 1920x1080 texture. Canonical
 [0736f8b](https://github.com/Marvisak/VIctory/commit/0736f8b375c3ae95fca0a21af6aa0b6cbc1251cf)
 by Calvix2k addresses missing Series S UI with ordered multi-plane
-composition. This is the current candidate; recording the actual plane
-array and validating composed pixels are required before claiming a fix.
+composition. The adapted change is in `362c44b`, retaining its original
+author and co-author credits.
 
 The adapted compositor preserves the single-plane ahead path; multiple
 planes complete synchronously so their descriptor heaps can be reused
@@ -228,8 +228,15 @@ descriptions. Tests inspect completed pixel readback
 before flip-discard presentation. They are ignored by default and require
 both an explicit device selection and `VICTORY_PRESENT_GPU_TESTS=1`; the
 actual device identity is checked before recording graphics commands.
-Normal and diagnostics compilation passed. This validates the synthetic
-mechanism; the real Series S plane array and picture still need verification.
+Normal and diagnostics compilation passed.
+
+Native run13 recorded two actual planes: a 1920x1080 scene and a 3840x2160
+UI target. Composed backbuffer readbacks at frames 256 and 512 contained
+the intro image; the early source readbacks in run12 had been entirely
+black. No nonzero DXGI present status or unsupported-source fallback was
+logged. This verifies rendered intro content, rather than physical screen
+observation, complete 3D correctness or an FPS improvement. Capture and
+synchronous composition make this unsuitable as a performance comparison.
 
 A separate placed-UAV adaptation was rejected during static review before
 any GPU execution. Replacing a filled read-only backing with a new writable
@@ -237,3 +244,44 @@ backing can lose untouched texels and mip levels on a partial write. Full
 overwrite tests do not cover that contract. Default views also need a valid
 typed format when storage becomes typeless. That candidate is outside the
 working branch and is not treated as a rendering fix.
+
+## Narrow CPU profile after the compositor change
+
+Run14 used the same `362c44b` binary, explicit RTX adapter, Series S,
+host FidelityFX provider 2.3.4, exact upload gaps and isolated first
+checkpoint. Capture and DRED were off. A 25 Hz sampler followed two
+submission-role threads for 20 seconds after 180 seconds of warm-up.
+The actual selected threads included `victory-submit`. It observed 72
+presentations, averaging 278.2 ms in this changing streaming scene. This
+is a diagnostic interval, not a comparable steady gameplay benchmark.
+
+Median thread suspension was 41 microseconds; p99 was 5243 microseconds
+and the maximum was 21837 microseconds. The sampler used 2.8% of one CPU
+core. Instrumentation overhead therefore remains a limitation.
+
+The submit worker spent approximately 176 ms per frame in its condition
+variable wait. The title thread spent about 155 ms waiting for a title
+event and 91 ms beneath `release_held_now`. These times come from different
+threads and cannot be added or assumed to be removable stalls. The aggregate
+profile does not identify the specific mutex or establish a missed wake-up.
+
+A separate measured candidate is texture destruction: about 20 ms per
+frame beneath `retire<HostTexture>`, including driver allocation and GPU
+virtual-address destruction. Source review confirms idle texture sweeping
+runs before the next submission is counted as started, so retirement drops
+objects immediately when no submission remains in flight. Disabling
+`VICTORY_TEXTURE_SWEEP` is only a bounded diagnostic comparison: it retains
+idle texture memory and is unsuitable as an unbounded 8 GB preset. Generic
+retirement also runs mip-publication callbacks, so moving all retired
+objects to a background thread would change correctness contracts.
+
+The first bounded control (run15) reached the free-RAM guard before its
+planned sampler interval. Shorter probes ran the sampler for 15 seconds
+after 60 seconds: run17 with texture sweeping and run18 without it. The
+control had not reached its first host upscaling dispatch when stopped;
+the second run reached it at about 60 seconds. Their different rendering
+phases prevent a causal FPS comparison. The disabled run had no texture
+sweep calls in its sampled stacks, confirming the switch took effect,
+but this does not demonstrate a performance gain. User launch settings
+retain texture sweeping. Future comparisons must match scene progress,
+rather than relying on fixed-time Enter presses and warm-up alone.
