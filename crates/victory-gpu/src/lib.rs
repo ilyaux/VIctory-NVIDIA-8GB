@@ -90,6 +90,7 @@ pub use host::on_failure;
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_written,
+    title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_reset_view,
+    title_memory_written,
     writing as kernel_will_write,
 };

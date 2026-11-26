@@ -744,6 +744,15 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
+    static REUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if from != 0 && *REUSE.get_or_init(|| std::env::var_os("VICTORY_ALIAS_REUSE").is_some_and(|v| v == "1")) {
+        use victory_gpu::framelog::{T, add};
+        add(T::AliasTriedPages, (len / PAGE) as u64);
+        if reuse_alias(&physical, to, from, len) {
+            add(T::AliasKeptPages, (len / PAGE) as u64);
+            return true;
+        }
+    }
     unmap(&mut physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
@@ -767,6 +776,74 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// Retains only exact, resident shared aliases. Every miss takes the original
+/// unmap/map path, including after a partial protection reset. The caller holds
+/// both mapping locks; external concurrent VM mutations are unsupported, as in `map`.
+fn reuse_alias(physical: &Physical, to: usize, from: usize, len: usize) -> bool {
+    if len == 0 || from == 0 || (to | from | len) & (PAGE - 1) != 0 {
+        return false;
+    }
+    let (Some(end), Some(source_end)) = (to.checked_add(len), from.checked_add(len)) else { return false };
+    if to < source_end && from < end { return false; }
+    for k in (0..len).step_by(PAGE) {
+        let Some((size, dest)) = physical.views.get(&(to + k)) else { return false };
+        let at = from + k;
+        let Some((&base, (bytes, source))) = physical.views.range(..=at).next_back()
+            .filter(|&(base, (bytes, _))| at - *base < *bytes) else { return false };
+        if *size != PAGE || at - base + PAGE > *bytes
+            || !Arc::ptr_eq(&dest.section, &source.section)
+            || Some(dest.index) != source.index.checked_add((at - base) / PAGE) {
+            return false;
+        }
+    }
+    // End snapshots and in-place views, then atomically reset protection and
+    // its guard metadata. Physical's identical reverse mappings remain.
+    for at in (to..end).step_by(PAGE) {
+        if !victory_gpu::title_memory_reset_view(at, PAGE) { return false; }
+    }
+    // PAGE_READWRITE alone cannot undo an earlier private copy-on-write page.
+    // Check every host page after reset; ordinary writes can no longer cause COW.
+    if !resident_shared(to, len) { return false; }
+    for at in (to..end).step_by(PAGE) {
+        let (_, slice) = &physical.views[&at];
+        victory_gpu::title_memory_view(at, PAGE, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    }
+    true
+}
+
+fn resident_shared(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+    static HOST_PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let page = *HOST_PAGE.get_or_init(|| {
+        let mut info = SYSTEM_INFO::default();
+        // SAFETY: a complete writable SYSTEM_INFO.
+        unsafe { GetSystemInfo(&mut info) };
+        info.dwPageSize as usize
+    });
+    if page == 0 || !PAGE.is_multiple_of(page) { return false; }
+    let Some(end) = at.checked_add(len) else { return false };
+    let mut next = at;
+    let mut records = [PSAPI_WORKING_SET_EX_INFORMATION::default(); 256];
+    while next < end {
+        let count = ((end - next) / page).min(records.len());
+        if count == 0 { return false; }
+        for (i, r) in records[..count].iter_mut().enumerate() {
+            *r = PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: (next + i * page) as *mut _, ..Default::default() };
+        }
+        // SAFETY: the kernel fills exactly count records; no target bytes are read.
+        if unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), records.as_mut_ptr().cast(), (count * size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32) } == 0 {
+            return false;
+        }
+        // PSAPI_WORKING_SET_EX_BLOCK: Valid bit0, Shared bit15 (not ShareCount).
+        if records[..count].iter().any(|r| unsafe { r.VirtualAttributes.Flags } & (1 | 1 << 15) != (1 | 1 << 15)) {
+            return false;
+        }
+        next += count * page;
+    }
+    len != 0
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -1031,10 +1108,14 @@ pub(crate) fn module() -> HleModule {
 }
 
 #[cfg(test)]
+#[path = "xmem/alias_tests.rs"]
+mod alias_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn query(address: *const c_void) -> BasicInformation {
+    pub(super) fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
         let mut info: BasicInformation = unsafe { std::mem::zeroed() };
         // SAFETY: a pseudo handle needs no closing.
@@ -1319,7 +1400,7 @@ mod tests {
     }
 
     /// `n` pages of one new allocation.
-    fn allocate(n: usize) -> Vec<usize> {
+    pub(super) fn allocate(n: usize) -> Vec<usize> {
         let (mut pages, mut given) = (vec![0; n], n);
         assert_eq!(
             XMemAllocatePhysicalPages(0, &mut given, pages.as_mut_ptr()),

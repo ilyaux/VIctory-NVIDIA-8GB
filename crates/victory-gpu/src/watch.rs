@@ -1116,6 +1116,12 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    notify_mapping_changed(at, len);
+    let mut g = guards();
+    forget_mapped(&mut g, at, len);
+}
+
+fn notify_mapping_changed(at: usize, len: usize) {
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
     crate::backreads::remapped(at, len);
@@ -1127,7 +1133,29 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     crate::inplace::views_gone(at, len);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+}
+
+/// Reopens an existing whole view without racing a guard re-arm. The runtime
+/// holds `title_memory_remapping`. Content-change notifications precede the
+/// coordinated protection reset; guard metadata remains live until that reset.
+pub fn title_memory_reset_view(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    if len == 0 || !at.is_multiple_of(BLOCK) || !len.is_multiple_of(BLOCK)
+        || at.checked_add(len).is_none() {
+        return false;
+    }
+    notify_mapping_changed(at, len);
     let mut g = guards();
+    let mut old = 0;
+    // SAFETY: only protection is changed; the kernel validates the whole view.
+    if unsafe { VirtualProtect(at as *const _, len, PAGE_READWRITE, &mut old) } == 0 {
+        return false;
+    }
+    forget_mapped(&mut g, at, len);
+    true
+}
+
+fn forget_mapped(g: &mut Guards, at: usize, len: usize) {
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -1597,6 +1625,52 @@ mod tests {
         }
         // SAFETY: the section's last reference.
         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
+    }
+
+    #[test]
+    fn a_view_reset_and_guard_rearm_keep_protection_and_tracking_together() {
+        use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+        let (section, one, two) = two_views(BLOCK);
+        let mut views = vec![one, two];
+        // Registration cannot open the other views past this cap. Correctness
+        // must come from the coordinated reset, including VIEW_GUARD=0.
+        for _ in 2..MANY_VIEWS + 2 {
+            let at = unsafe { MapViewOfFile(section as _, FILE_MAP_WRITE, 0, 0, BLOCK) }.Value as usize;
+            assert_ne!(at, 0);
+            crate::inplace::title_memory_view(at, BLOCK, section, 0);
+            views.push(at);
+        }
+        assert!(guard(two, two + BLOCK).is_some());
+        assert!(title_memory_reset_view(two, BLOCK));
+        {
+            let g = guards();
+            assert!(writable(two));
+            assert!(!g.protected.contains(&(two / BLOCK)));
+            assert!(!g.clean.contains(&(two / BLOCK)));
+        }
+        let together = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let worker = {
+            let together = together.clone();
+            std::thread::spawn(move || {
+                together.wait();
+                for _ in 0..256 { assert!(guard(two, two + BLOCK).is_some()); }
+            })
+        };
+        together.wait();
+        for _ in 0..256 {
+            assert!(title_memory_reset_view(two, BLOCK));
+            let g = guards();
+            assert_eq!(g.protected.contains(&(two / BLOCK)), !writable(two),
+                "a concurrent guard is either still read-only and tracked, or reopened and forgotten");
+        }
+        worker.join().unwrap();
+        crate::inplace::title_memory_view(two, BLOCK, section, 0);
+        assert!(guard(two, two + BLOCK).is_some());
+        // SAFETY: our live view; the installed guard handler observes this write.
+        unsafe { (two as *mut u8).write_volatile(73) };
+        assert_eq!(guard(two, two + BLOCK), Some(vec![two / PAGE]));
+        assert_eq!(unsafe { (one as *const u8).read_volatile() }, 73);
+        drop_views(section, &views, BLOCK);
     }
 
     /// The title wrote the pages of a guarded texture through another view
