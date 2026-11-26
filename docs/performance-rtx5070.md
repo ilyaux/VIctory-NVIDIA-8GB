@@ -285,3 +285,43 @@ sweep calls in its sampled stacks, confirming the switch took effect,
 but this does not demonstrate a performance gain. User launch settings
 retain texture sweeping. Future comparisons must match scene progress,
 rather than relying on fixed-time Enter presses and warm-up alone.
+
+## Wave64 investigation: the first LDS refinement remains insufficient
+
+An unmerged candidate refines the mixed-LDS rejection for exactly 64
+threads. It requires singleton invocation sets for overlapping accesses,
+or disjoint byte ranges; integer atomic additions are exempted only when
+their returned values are unused. A preliminary logical-half rule was
+rejected because logical thread coordinates do not prove physical host
+wave membership. The corrected singleton rule passed 11 CPU regressions
+and independent source reviews, including Claude Code Opus 5.5.
+
+The first real failing compute-program comparison was CPU-only, with
+local-wave and forced-wide modes disabled. Both control and candidate
+emitted DXIL and passed the SDK validator, but their outputs were identical
+and still declared WaveSize64. Validator success alone does not establish
+RTX compatibility. No candidate GPU or game execution followed.
+
+Tracing found missing known-bit handling for `v_lshl_add_u32`. Reusing
+the existing shift/add rules now recognizes the singleton finalizer; a
+new original synthetic regression covers a group-ID shift combined with
+a local thread ID. All 12 CPU regressions passed after removing temporary
+case-inspection instrumentation. The real program still retains Wave64:
+an atomic return affects a clipped allocation count, another atomic's
+increment and output records. The candidate remains outside this branch.
+
+An original synthetic counterexample explains the remaining restriction.
+With a shared limit of one, invocation 0 requests amounts `[0, 1]` over
+two iterations and invocation 32 requests `[1, 0]`. Preserving the original
+iteration phases grants the budget to invocation 32. Independent half-wave
+progress can grant it to invocation 0 instead, despite an equal total.
+Observed returns therefore need an ordering contract; treating them as
+unused counters would change work allocation. The next investigation is
+uniform loop phases with barriers outside divergent guards.
+
+Placed-UAV diagnostics also needed a narrower first sample: run19's first
+warning came from a null-address placeholder. Such descriptors now retain
+the same null fallback without consuming the one-time warning. Run20 used
+the explicit RTX and provider 2.3.4, stopped after 35 seconds, and logged no
+nonnull unsupported placed view. That early interval cannot rule out the
+path during later gameplay or attribute black faces to it.

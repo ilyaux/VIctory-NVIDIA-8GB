@@ -2885,6 +2885,10 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             const BUFFER: u32 = 1;
             if resource[0] != BUFFER {
+                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                if address == 0 {
+                    return None;
+                }
                 // shortcut: unordered access to a texture the title placed
                 // itself is not mirrored; give it a resource as shader
                 // views of such textures get when a dispatch writes one.
@@ -2897,14 +2901,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     flags = format_args!("{:#x}", resource[12]),
                     view_format = desc[0],
                     view_dimension = desc[1],
-                    address = format_args!("{:#x}", u64::from(desc[10]) | u64::from(desc[11]) << 32),
+                    address = format_args!("{address:#x}"),
                     known_resource_same_words = crate::resource::placed_known(
-                        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                        address,
                         resource
                     )
                     .is_some(),
                     known_resource_without_unordered = crate::resource::placed_known(
-                        u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                        address,
                         &{
                             let mut words = *resource;
                             words[12] &= !4;
