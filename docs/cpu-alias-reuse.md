@@ -48,4 +48,20 @@ The default watch selection passes 15 tests with one manual event-log-writing
 test ignored. A concurrent guard/reset test with 66 aliases also passes alone
 with `VICTORY_VIEW_GUARD=0`. Running the entire old watch suite with that switch
 disabled fails four tests that expect cross-view guarding; that run is not a
-pass. Native usage, rendering and frame-rate comparisons remain required.
+pass.
+
+## First native comparison
+
+The same pinned binary completed two bounded trials, each with over 90 seconds
+of qualified 3D and no logged device error. Complete warm windows produced
+139 frames in 79.7 seconds with reuse off (1.74 FPS) and185 frames in74.4 seconds
+with reuse on (2.49 FPS). These are observations, not an established speedup:
+scene and cache timing differed, and retained pages were zero in the reported
+warm-frame samples despite nonzero examined pages. The frame logger averages
+ordinary frames and lists only some long frames, so this is not an exact total
+of every retained page or every kernel call.
+
+The images still have rendering defects and correct controllable 30 FPS
+gameplay is unverified. The switch remains off by default and is not enabled
+in the user's launcher. Further work should establish rejection causes and
+the cost of creating new aliases before crediting this path with useful gains.
