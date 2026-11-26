@@ -49,6 +49,10 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::{Interface, s};
 use windows_sys::Win32::System::Memory as mem;
 
+#[cfg(test)]
+#[path = "inplace/section_canary.rs"]
+mod section_canary;
+
 /// The unit heaps and placed buffers are cut on, and the console's page.
 const K64: usize = 64 << 10;
 /// The host's write watching (not in windows-sys' memory module).
