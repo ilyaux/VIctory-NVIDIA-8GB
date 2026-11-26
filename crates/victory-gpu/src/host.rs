@@ -7722,9 +7722,21 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 };
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::RpmUs, started.elapsed().as_micros() as u64);
+        add(C::RpmCalls, 1);
+        add(C::RpmBytes, len as u64);
+        add(C::RpmDoneBytes, done as u64);
+        add(C::RpmFailed, u64::from(!ok));
+    }
+    ok
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -8285,7 +8297,7 @@ impl Meter {
             if through + left > 0.0 {
                 tracing::info!(
                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
+                     {through:.1} copied unlocked (guarded plain copy or kernel fallback), {left:.1} left for the next refresh (a page was not there)"
                 );
             }
         }

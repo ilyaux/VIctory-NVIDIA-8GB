@@ -74,8 +74,9 @@ pub(crate) fn on() -> bool {
 /// Copies made in place, their bytes, the copies that met a page that was
 /// not there (and went to the kernel's copy), and the copies not tried in
 /// place because their source faulted lately ([`RECENT`]) or they were
-/// under [`LEAST`] bytes, since the last line.
-static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// under [`LEAST`] bytes, then microseconds in actual guarded calls
+/// (diagnostics builds), since the last line.
+static COUNT: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 
 /// The fewest bytes copied in place. A read of a byte or a word is how the
 /// layer ASKS whether a page is there (a texture's first page, a record):
@@ -196,7 +197,11 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
     let whole = guarded(to, from, len);
+    #[cfg(feature = "diagnostics")]
+    COUNT[5].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
     if whole {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
@@ -212,11 +217,14 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let [copies, bytes, gone, lately, small, us] = [0, 1, 2, 3, 4, 5].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let timing = if cfg!(feature = "diagnostics") {
+        format!("; {:.3} ms in actual guarded calls, all threads", us / 1e3)
+    } else { String::new() };
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
          that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
-         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
+         faulted in the last two seconds, {small:.0} of under {LEAST} bytes{timing}",
         bytes / 1e6
     );
 }

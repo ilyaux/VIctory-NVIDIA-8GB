@@ -405,20 +405,21 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// ms, the texture's own lock 0).
 ///
 /// With the switch the refresh asks for the lock without waiting. If the
-/// runtime has it, the texture is read through the kernel instead, which
-/// needs no lock: it fails if a page is not there, and then the texture is
-/// left as it is and read at its next refresh, a frame later. A read
-/// through the kernel costs about 0.6 ms a megabyte against 0.3 in place.
+/// runtime has it, `host::read_into` copies into host memory without this
+/// lock: guarded plain copy first if enabled, then kernel fallback. A
+/// failed read leaves the texture for its next refresh. Historical kernel
+/// copies cost about 0.6 ms a megabyte against 0.3 in place.
 ///
 /// What changes for the picture: a texture that arrives while the runtime
-/// is remapping may show a frame later. It never shows partly read.
+/// is remapping may show a frame later. A failed read is not detiled;
+/// a successful unlocked copy is not an atomic snapshot across remaps.
 fn no_wait() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
-/// through the kernel because title memory was being remapped, and those
+/// unlocked because title memory was being remapped, and those
 /// left for the next refresh because a page was not there.
 pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -1077,8 +1078,7 @@ impl Staging {
         // 74).
         let _mapped = if no_wait() {
             // Not waited for: while the runtime remaps title memory the
-            // texture is read through the kernel instead, whole or not at
-            // all (`no_wait`).
+            // texture is copied without this lock (`no_wait`).
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };
@@ -1153,8 +1153,8 @@ impl Staging {
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
-    /// the texture is read through the kernel, which fails if a page of it
-    /// is not there at this moment. Then nothing is taken and the texture
+    /// the texture is copied without the mapping lock, with kernel fallback
+    /// after guarded plain copy. If the read fails, nothing is taken and the texture
     /// is looked at again at its next refresh (what was learnt about writes
     /// to it is forgotten, so that it is not passed over as unwritten).
     /// Returns the bytes read.

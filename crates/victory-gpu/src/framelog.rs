@@ -668,6 +668,10 @@ pub fn frame() {
     // atomics are read separately, not a transaction across worker threads.
     let t = |counter: T| totals[counter as usize];
     tracing::info!(
+        "VM reader/remap totals: remaps {} remap us {} reader-wait us {} refresh us {} refresh-still us {} (overlapping all-thread wall times)",
+        t(T::Remaps), t(T::RemapUs), t(T::RemapWaitUs), t(T::RefreshUs), t(T::RefreshStillUs),
+    );
+    tracing::info!(
         "physical mapping totals: direct {}/{}/{} scatter {}/{}/{} alias {}/{}/{} batch {}/{}/{} tail {}/{}/{} other {}/{}/{} \
          (attempts/bytes/us); map/unmap {}/{} unmap bytes {} no-view unmaps {}; tail pages {} repeat potential {} batched {} restore failures {}; \
          phase us split {} mapview {} commit {} notify {} view {} insertion {} removal {} unmap {} physical-lock {}",
