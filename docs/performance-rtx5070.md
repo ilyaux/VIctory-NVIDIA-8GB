@@ -92,3 +92,36 @@ picture remained invalid and this run is not an FPS improvement result.
 Complete picture, controls and comparable frame times remain to be checked.
 No game binaries, shader dumps, screenshots, saves or raw logs are included in
 this repo.
+
+## Opt-in parallel hashing of card copies
+
+Branch `perf/rtx5070-card-hash` carries Martin Hartfelder's
+[64-thread card hash](https://github.com/fxceless/victory-fork/commit/55572246864888974da5bf8f418a092e73d66932),
+with the opt-in selection from fxceless's
+[6d20eed](https://github.com/fxceless/victory-fork/commit/6d20eed6ae8afe37c52f1911b46537b0ea8bcd0d).
+`VICTORY_CARD_HASH_WIDE=1` distributes each piece's hash across 64 threads;
+the default retains the previous hash. The store and compare always select
+the same form for a process. Both WARP regressions passed for both forms,
+including changed-byte offsets in skewed spans; the diagnostics build passed.
+
+Native runs 08 and 09 used the same binary, isolated checkpoint, Series X
+profile and fast preset. Only the hash flag changed. The following are medians
+of usual-frame log lines with at least 1000 draws and at least three lists of
+each measured layer-work kind (20 control lines, 19 wide-hash lines):
+
+| Metric | Previous hash | 64-thread hash |
+| --- | ---: | ---: |
+| Send-and-hash lists per frame | 23.9 ms | 5.1 ms |
+| Compare lists per frame | 6.8 ms | 2.5 ms |
+| Send-and-hash time per list | 4.10 ms | 1.00 ms |
+| Compare time per list | 1.14 ms | 0.48 ms |
+| Draws per usual frame | 3838 | 3501 |
+| Title GPU lists per usual frame | 73.0 ms | 57.1 ms |
+| Usual frame time | 175 ms | 152 ms |
+
+This supports reduced time in the layer's hash work on the RTX 5070. The scene
+progression and workloads differed, and the second run had warmer pipelines;
+the usual-frame logger excludes long frames. The table therefore does not
+establish an isolated full-frame speedup or sustained gameplay performance.
+Rendering defects remained in both runs. Neither short run logged device
+removal; both were deliberately stopped. The 30 FPS goal remains unmet.
