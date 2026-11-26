@@ -1,11 +1,11 @@
-# RTX 5070 Laptop performance investigation
+# NVIDIA 8 GB performance investigation
 
-Target: stable 30 FPS in real gameplay on an RTX 5070 Laptop 8 GB,
-Ryzen AI 7 350 and 32 GB RAM. Menu FPS does not satisfy the target.
+Target: stable 30 FPS in real gameplay on an AMD CPU and an NVIDIA RTX
+50-series GPU with 8 GB VRAM. Menu FPS does not satisfy the target.
 
 ## 2026-11-26: first native baseline
 
-Build: `1e34f02`, Windows 11, driver 621.24, diagnostics profile, Series X.
+Build: `1e34f02`, diagnostics profile, Series X.
 Levels on demand enabled; mip reclamation disabled. A 100 Hz sampled profiler
 and the built-in frame logger were enabled. Test saves were copied from the
 user's data into an isolated directory. Game files, captures, caches and raw

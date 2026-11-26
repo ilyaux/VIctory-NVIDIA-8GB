@@ -2,7 +2,7 @@
 
 Preserved from `fxceless/victory-fork` at `9c184b3`, with the mip-reclamation
 notes carried at `b472041`. Gameplay measurements below belong to that upstream
-fork and its RTX 4070 test machine. For this fork's RTX 5070 Laptop status, see
+fork and its RTX 4070 test machine. For this fork's NVIDIA 8 GB status, see
 [README.md](README.md).
 
 # VIctory fork (work in progress)
