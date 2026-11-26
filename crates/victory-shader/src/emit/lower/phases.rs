@@ -56,11 +56,12 @@ pub(in crate::emit) fn phase_class(p: &Program, st: &Structured) -> Result<(), W
             || matches!(n, "v_readlane_b32" | "v_writelane_b32" | "v_readfirstlane_b32")
             || n.starts_with("s_wqm")
             || n.starts_with("s_quadmask")
+            || matches!(n, "s_memtime" | "s_memrealtime" | "s_getreg_b32")
             || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
             || reads_mask_as_data(st, i)
     });
     if cross || lane_constant_masks(st) {
-        return Err("cross-lane code in a strict LDS phase program");
+        return Err("cross-lane or timing-sensitive code in a strict LDS phase program");
     }
     let ends = p.blocks.iter().filter(|b| b.exit == Exit::End).count();
     if ends != 1 || p.blocks.iter().any(|b| b.exit == Exit::Indirect) {
@@ -158,6 +159,15 @@ pub(in crate::emit) fn phase_loops(p: &Program, st: &Structured, barriers: &[usi
 }
 
 impl super::Lower<'_> {
+    /// A scalar wait belongs to the source wave, not each host half separately.
+    /// Conservatively finish all memory requests even for a partial/LGKM wait.
+    pub(super) fn phase_wait(&mut self) {
+        self.strict_barrier(self.cur);
+        let mode = self.s.m.i32(1 | 2 | 8);
+        let void = self.s.t.void;
+        self.s.op(self.cur, "barrier", super::Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
     /// Under [`with_strict_phases`]: a barrier about to go into DXIL block `block` waits for
     /// the group and every thread runs it together: in the entry block before anything
     /// branches (`wave_base`), or as the current block of an IR block every lane runs, outside

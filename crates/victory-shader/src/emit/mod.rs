@@ -384,7 +384,7 @@ pub fn emit(
         // Opt-in strict single-console-wave LDS phases. Unlike the general wide
         // retry this audits every emitted barrier and every loop before acceptance.
         if std::env::var_os("VICTORY_LDS_PHASES").is_some_and(|v| v == "1") {
-            let phases = try_lds_phases(c, native, p);
+            let phases = try_lds_phases(c, native);
             report("strict LDS phases", &phases);
             if done(&phases) {
                 return phases.map(|(shader, _)| shader);
@@ -640,7 +640,6 @@ fn widen(
 pub(super) fn try_lds_phases(
     c: &Container,
     native: &NativeProgram,
-    p: &ir::Program,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     let refuse = |what| Err(ShaderError::Unsupported { offset: 0, what });
     let crate::native::StageIo::Cs(cs) = native.io else {
@@ -657,6 +656,8 @@ pub(super) fn try_lds_phases(
     if group_sync() == 0 {
         return refuse("strict LDS phases without group barriers that wait (VICTORY_GROUP_SYNC=0)");
     }
+    let kept = crate::spill::build_with_waits(native)?;
+    let p = &kept;
     let st = structure::structure(p)?;
     if let Err(what) = lower::phase_class(p, &st) {
         return refuse(what);

@@ -1,7 +1,8 @@
 //! One-to-one SSA form of a native program (decision 0003, step 1).
 //!
 //! Every machine instruction becomes one [`Inst`], except scheduling-only
-//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which are dropped.
+//! ones (`s_nop`, `s_waitcnt*`, `s_inst_prefetch`...), which the ordinary build drops.
+//! The strict phase path can retain memory waits with [`build_with_waits`].
 //! Each register dword is a variable: a read names the [`Value`] it sees, a
 //! write defines a new one, and [`Phi`]s merge values where control flow
 //! joins. Nothing is raised: an instruction keeps its opcode and decoded
@@ -127,6 +128,15 @@ impl Inst {
 /// count. Fails on instructions the IR cannot express yet
 /// ([`ShaderError::Unsupported`]).
 pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    build_inner(code, wave64, vgprs, false)
+}
+
+/// Keeps source memory waits for lowering that emulates a wave with several host waves.
+pub(crate) fn build_with_waits(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderError> {
+    build_inner(code, wave64, vgprs, true)
+}
+
+fn build_inner(code: &[u8], wave64: bool, vgprs: u16, keep_waits: bool) -> Result<Program, ShaderError> {
     let mut list = gfx10::decode(code)?;
     let lanes = 1 + u8::from(wave64);
     let isa = |offset, reason| ShaderError::Isa { offset, reason };
@@ -198,7 +208,12 @@ pub fn build(code: &[u8], wave64: bool, vgprs: u16) -> Result<Program, ShaderErr
                 Flow::Stop => Exit::End,
             };
         }
-        if let Some((mut reads, writes)) = effects(&machine, &fields, name, lanes, vgprs)? {
+        let effects = if keep_waits && name.starts_with("s_waitcnt") {
+            Some((Vec::new(), Vec::new()))
+        } else {
+            effects(&machine, &fields, name, lanes, vgprs)?
+        };
+        if let Some((mut reads, writes)) = effects {
             // Lanes disabled in EXEC keep the old value.
             for w in writes.iter().filter(|w| matches!(w, Reg::V(_))) {
                 if !reads.contains(w) {

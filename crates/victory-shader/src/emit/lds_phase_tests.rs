@@ -35,6 +35,15 @@ fn ds(name: &str, offset: u16, dst: u8) -> [u32; 2] {
         1 | 2 << 8 | if reads { u32::from(dst) << 24 } else { 0 }]
 }
 
+fn buffer(name: &str, data: u8, returns: bool) -> [u32; 2] {
+    [0x38 << 26 | opcode(Encoding::Mubuf, name) << 18 | 1 << 12 | u32::from(returns) << 14,
+        128 << 24 | 2 << 16 | u32::from(data) << 8 | 7]
+}
+
+fn wait_stores() -> u32 {
+    0xb000_0000 | opcode(Encoding::Sopk, "s_waitcnt_vscnt") << 23 | 125 << 16
+}
+
 #[derive(Default)]
 struct Code {
     words: Vec<u32>,
@@ -173,12 +182,35 @@ fn allocator_variant(probe: bool, early_exit: Option<EarlyExit>) -> NativeProgra
     }
 }
 
+/// A source-wave wait must cover the other half's global stores too.
+fn global_wait_program() -> NativeProgram {
+    let mut native = allocator_program();
+    let mut words: Vec<u32> = native.code.chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+    assert_eq!(words.pop(), Some(0xbf81_0000));
+    words.push(wait_stores());
+    words.extend([cmp("v_cmp_eq_u32", 160, 0), sop1("s_and_saveexec_b64", 18, 106), mov(6, 129), mov(7, 132)]);
+    // Only invocation32 follows this dependent atomic chain. A low host half
+    // must wait for it and the final marker store before invocation0 reloads.
+    for _ in 0..64 { words.extend(buffer("buffer_atomic_add", 6, true)); }
+    words.extend([mov(6, 170), mov(7, 128)]); // marker42 at byte0
+    words.extend(buffer("buffer_store_dword", 6, false));
+    words.extend([sop1("s_mov_b64", 126, 18), wait_stores(), mov(9, 128),
+        cmp("v_cmp_eq_u32", 128, 0), sop1("s_and_saveexec_b64", 20, 106)]);
+    words.extend(buffer("buffer_load_dword", 9, false));
+    words.extend([0xbf80_0000 | opcode(Encoding::Sopp, "s_waitcnt") << 16,
+        sop1("s_mov_b64", 126, 20), vop2("v_lshlrev_b32", 7, 130, 0)]);
+    words.extend(buffer("buffer_store_dword", 9, false));
+    words.push(0xbf81_0000);
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    native
+}
+
 fn empty_container() -> Container<'static> { Container { digest: [0; 16], version: (1, 0), parts: Vec::new() } }
 
 fn phase_shader(native: &NativeProgram) -> Result<HostShader, ShaderError> {
-    let p = crate::spill::build(native)?;
     let previous = lower::TEST_HOST_WAVE.replace(Some(32));
-    let result = super::try_lds_phases(&empty_container(), native, &p);
+    let result = super::try_lds_phases(&empty_container(), native);
     lower::TEST_HOST_WAVE.set(previous);
     let (shader, wave) = result?;
     assert_eq!(wave, Some(32), "a strict phase candidate must explicitly require WaveSize32");
@@ -235,6 +267,22 @@ fn native_lds_bounds_are_preserved_with_exchange_storage() {
     let native = allocator_program_with_oob_probe(true);
     let mut shader = phase_shader(&native).expect("strict bounded LDS lowering");
     validate(&mut shader);
+}
+
+#[test]
+fn source_waits_keep_global_memory_order_in_validated_wave32() {
+    let native = global_wait_program();
+    let p = crate::spill::build_with_waits(&native).unwrap();
+    assert_eq!(p.blocks.iter().flat_map(|b| &b.insts).filter(|i| i.name().starts_with("s_waitcnt")).count(), 3);
+    let ordinary = crate::spill::build(&native).unwrap();
+    assert!(!ordinary.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name().starts_with("s_waitcnt")),
+        "ordinary translation retains its existing scheduling behavior");
+    let mut shader = phase_shader(&native).expect("source waits in strict phases");
+    validate(&mut shader);
+    // Optional export of this OWN synthetic shader for SDK disassembly, never a game container.
+    if let Some(path) = std::env::var_os("VICTORY_LDS_SYNTHETIC_OUT") {
+        std::fs::write(path, &shader.dxil).unwrap();
+    }
 }
 
 #[test]
@@ -295,11 +343,14 @@ fn external_case_requires_wave32_and_cpu_validation() {
     let native = crate::native_programs(part.data).unwrap().into_iter().find(|n| n.stage == HwStage::Cs).unwrap();
     let p = crate::spill::build(&native).unwrap();
     let previous = lower::TEST_HOST_WAVE.replace(Some(32));
-    let result = super::try_lds_phases(&c, &native, &p);
+    let result = super::try_lds_phases(&c, &native);
     let (mut shader, wave) = result.expect("strict real-case phase candidate");
     assert_eq!(wave, Some(32));
     validate(&mut shader);
     eprintln!("external case: WaveSize32, CPU validator PASS, {} bytes", shader.dxil.len());
+    let waits = crate::spill::build_with_waits(&native).unwrap().blocks.iter()
+        .flat_map(|b| &b.insts).filter(|i| i.name().starts_with("s_waitcnt")).count();
+    eprintln!("external source wait points: {waits}");
     if std::env::var("VICTORY_LDS_PHASES").as_deref() == Ok("1") {
         let st = structure::structure(&p).unwrap();
         let io = io::raise(&p, &native).unwrap();
@@ -393,6 +444,8 @@ fn allocator_phase_manual_preserves_objects_on_explicit_device() {
     validate(&mut phase);
     let mut bounded = phase_shader(&allocator_program_with_oob_probe(true)).expect("native bounds before device creation");
     validate(&mut bounded);
+    let mut global = phase_shader(&global_wait_program()).expect("global source waits before device creation");
+    validate(&mut global);
     let mut exits: Vec<_> = [EarlyExit::Direct, EarlyExit::Stub, EarlyExit::Repeated, EarlyExit::RawVccNz, EarlyExit::RawVccZ].into_iter().map(|exit|
         phase_shader(&allocator_variant(false, Some(exit))).expect("collective exit before device creation")).collect();
     for shader in &mut exits { validate(shader); }
@@ -410,5 +463,15 @@ fn allocator_phase_manual_preserves_objects_on_explicit_device() {
     for _ in 0..16 { dispatch_allocator(&host, &phase, false, false); }
     for _ in 0..16 { dispatch_allocator(&host, &bounded, true, false); }
     for shader in &exits { for _ in 0..8 { dispatch_allocator(&host, shader, false, true); } }
-    eprintln!("Wave32 strict phases: 16 allocation +16 native-bounds +40 collective-exit/raw-VCC completed readbacks PASS");
+    for _ in 0..8 {
+        use super::host::{Dispatch, Root, View};
+        let (root, pipeline) = host.compute_pipeline(&global).unwrap();
+        let out = host.dispatch(&root, &pipeline, &Dispatch {
+            roots: vec![(0, Root::Constants(vec![0; global.user_data_dwords().max(1) as usize]))],
+            views: &[View::RawUav(64)], samplers: &[], groups: [1, 1, 1],
+        }).unwrap();
+        let expected: Vec<_> = (0..64).map(|i| if i == 0 { 42 } else { 0 }).collect();
+        assert_eq!(out, [expected], "invocation0 must see invocation32's marker after the source wait");
+    }
+    eprintln!("Wave32 strict phases: 16 allocation +16 native-bounds +40 collective-exit/raw-VCC +8 global-wait completed readbacks PASS");
 }

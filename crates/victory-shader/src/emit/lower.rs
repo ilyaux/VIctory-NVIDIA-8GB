@@ -4811,6 +4811,10 @@ impl<'a> Lower<'a> {
         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
         let offset = inst.machine.offset;
         let name = inst.name();
+        if STRICT_PHASES.get() && name.starts_with("s_waitcnt") {
+            self.phase_wait();
+            return Ok(());
+        }
         self.local_ok = name.starts_with("s_bcnt1_i32_")
             || name.starts_with("s_ff1_i32_")
             || name.starts_with("v_mbcnt_");

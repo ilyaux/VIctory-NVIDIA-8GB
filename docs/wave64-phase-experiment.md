@@ -14,6 +14,12 @@ lane-dependent branch. Every emitted barrier must be outside lane guards,
 in a block the whole group reaches; loop entry, exits and iteration limits
 are audited too. A failed audit returns to the existing retry paths.
 
+Scalar `s_waitcnt*` instructions conservatively finish memory requests for the
+whole source wave with an all-memory group fence. Partial and LGKM waits are
+strengthened explicitly, not treated as native UAV-completion operations.
+These additional barrier points undergo the same convergence and loop audits.
+Programs observing clocks or asynchronous hardware registers are excluded.
+
 This switch does not make every shader exact or replace those existing paths.
 `VICTORY_WAVE_WHY=1` distinguishes `strict LDS phases` acceptance from a legacy
 retry. The translator fingerprint automatically includes the new source and
@@ -66,3 +72,11 @@ any title-range allocation or copy. CPU boundary checks pass. An explicit WARP
 test creates valid boundary views and rejected/null views with the device still
 alive; it submits no GPU commands. That check does not identify the native
 trial's exact offending API call.
+
+The source-wait follow-up preserves wait instructions in a separate IR build;
+ordinary translation keeps its previous scheduling behavior. Its regression
+first failed because the ordinary IR had removed all three synthetic waits.
+With retention, SDK disassembly confirms three mode11 barriers at those points.
+The updated checks pass: 184 CPU tests, offline real-container validation with
+26 retained waits, and 80 explicit RTX readbacks including eight cross-half UAV
+store/wait/read checks. A repeat native run of this version is still required.
