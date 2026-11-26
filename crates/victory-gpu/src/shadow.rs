@@ -2146,7 +2146,7 @@ fn changed_runs_wide(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide};
+    use super::{PIECE, back_piece, changed_chunks, changed_runs, changed_runs_bytes, changed_runs_wide, joined_over};
 
     #[test]
     fn changed_chunks_hold_every_changed_byte() {
@@ -2352,6 +2352,46 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn exact_merge_preserves_gpu_stores_between_title_changes() {
+        for gap_bytes in [1, 64, 65] {
+            let held = vec![0u8; gap_bytes + 6];
+            let mut title = held.clone();
+            let left = 2;
+            let right = left + gap_bytes + 1;
+            title[left] = 0x11;
+            title[right] = 0x22;
+            let mut after_gpu = held.clone();
+            after_gpu[left - 1] = 0x33;
+            after_gpu[left + 1..right].fill(0xa5);
+            after_gpu[right + 1] = 0x44;
+
+            let changes = changed_runs(&title, &held);
+            let upload = |gap| {
+                let mut card = after_gpu.clone();
+                for (at, n) in joined_over(changes.clone(), gap) {
+                    card[at..at + n].copy_from_slice(&title[at..at + n]);
+                }
+                card
+            };
+            let mut expected = after_gpu.clone();
+            expected[left] = title[left];
+            expected[right] = title[right];
+            assert_eq!(upload(0), expected, "{gap_bytes} unchanged bytes");
+
+            // Positive control: joining over gaps destroys stores inside them.
+            let approximate = upload(64);
+            assert_eq!((approximate[left], approximate[right]), (0x11, 0x22));
+            assert_eq!((approximate[left - 1], approximate[right + 1]), (0x33, 0x44));
+            if gap_bytes <= 64 {
+                assert!(approximate[left + 1..right].iter().all(|&b| b == 0));
+                assert_ne!(approximate, expected);
+            } else {
+                assert_eq!(approximate, expected);
+            }
+        }
     }
 }
 

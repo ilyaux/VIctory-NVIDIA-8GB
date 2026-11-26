@@ -125,3 +125,62 @@ the usual-frame logger excludes long frames. The table therefore does not
 establish an isolated full-frame speedup or sustained gameplay performance.
 Rendering defects remained in both runs. Neither short run logged device
 removal; both were deliberately stopped. The 30 FPS goal remains unmet.
+
+## Host FidelityFX and the remaining picture defects
+
+Branch `perf/rtx5070-fidelityfx-host` selectively adapts the optional host
+FidelityFX bridge from Marvis's
+[0b35b7f](https://github.com/Marvisak/VIctory/commit/0b35b7fe7d728c9a9c205cb3719a0f11744321ce),
+with original co-author Claude Fable 5.2. No SDK DLL is included. The bridge
+requires `VICTORY_FIDELITYFX_DIR`, an explicitly selected hardware adapter and
+`VICTORY_FIDELITYFX_PROVIDER`. Unavailable or ambiguous selections fail closed.
+Without an SDK directory the original title DLL path remains in use.
+
+Use `VICTORY_D3D12_ADAPTER=NVIDIA GeForce RTX 5070 Laptop GPU` on this machine.
+A test executable does not inherit the game's Windows GPU preference: the
+first manual integration test selected the AMD integrated adapter, failed
+with zero output, and coincided with a user-reported display blackout and DWM
+restart. That failed test is not validation. The fixture now requires an
+explicit adapter, checks its identity before loading the SDK, and waits for
+the asynchronous queue before readback and context destruction.
+
+With the official SDK 2.4.0 and provider `2.3.4`, the full flat-colour
+1280x720-to-1920x1080 integration test passed on WARP and the explicitly
+selected RTX 5070. All output RGB pixels were checked, over two dispatches.
+Four bridge unit tests and the metadata-only adapter rejection test passed.
+The integration test is manual and ignored by default. Providers 3.1.5 and
+3.1.6 faulted inside WARP's compute compiler and were not retried on hardware.
+
+Native run10 used Series S, the first isolated checkpoint and host provider
+2.3.4. Actual context creation and upscaling dispatch were logged, bypassing
+the unsupported Xbox upscaler programs. Gameplay still had black faces and
+unstable objects; occasional 8 FPS does not establish a speedup. In the last
+two minutes, 24 usual-frame samples had a median frame time of 119 ms, with
+75 ms preparation, 44 ms copying and 35 ms heap work. These counters overlap
+and must not be added together. The per-list GPU meter also needs independent
+validation before being used to infer a hardware FPS ceiling. The run was
+closed normally after about eleven minutes.
+
+### Correctness before more aggressive settings
+
+Run10 inherited `VICTORY_MERGE_GAP=64` from the experimental fast preset. This
+joins uploads across unchanged CPU bytes and can overwrite shader stores in
+those gaps with old CPU values. The exact default is `VICTORY_MERGE_GAP=0`.
+The CPU-only regression
+`shadow::merge_tests::exact_merge_preserves_gpu_stores_between_title_changes`
+covers gaps of 1, 64 and 65 bytes, with GPU stores inside and outside them.
+Exact uploads preserve every store; the approximate mode is a positive
+control demonstrating loss within its 64-byte threshold. All six merge tests
+passed. This proves the mechanism, not its attribution to a visible object.
+The next native comparison changes only the gap setting to zero.
+
+Two separate unsupported paths remain: placed texture UAV descriptors bind
+null views, and seven rejected compute programs still emit wave64 on this
+wave32 adapter. Canonical
+[61bfc77](https://github.com/Marvisak/VIctory/commit/61bfc773d3296252918572921237075d8a748649)
+addresses placed UAVs but depends on shared host-texture ownership missing
+from this fork. It requires an adapted port and view-order/lifetime tests.
+Forcing wave32 does not preserve the lane and shared-memory semantics of the
+failed shaders; forcing wave64 has a documented device-loss history. Neither
+switch is treated as a fix. Attribution of these paths to black faces is
+still open. Correct picture and stable 30 FPS remain unverified.
