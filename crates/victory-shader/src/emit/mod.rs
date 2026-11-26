@@ -89,6 +89,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod lds_phase_tests;
 mod own_bits;
 mod rect;
 mod sampler;
@@ -379,6 +381,15 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // Opt-in strict single-console-wave LDS phases. Unlike the general wide
+        // retry this audits every emitted barrier and every loop before acceptance.
+        if std::env::var_os("VICTORY_LDS_PHASES").is_some_and(|v| v == "1") {
+            let phases = try_lds_phases(c, native, p);
+            report("strict LDS phases", &phases);
+            if done(&phases) {
+                return phases.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -455,7 +466,7 @@ pub fn emit(
                         Some(p),
                     ];
                     if let Some(base) = bases.into_iter().flatten().next() {
-                        let again = widen(c, native, base, why);
+                        let again = widen(c, native, base, why, None, None);
                         report("wave-wide branches", &again);
                         if done(&again) {
                             return again.map(|(shader, _)| shader);
@@ -517,7 +528,7 @@ pub fn emit(
                 && what == lower::LANE_MASK
                 && std::env::var_os("VICTORY_WAVE_WIDE").is_none_or(|v| v != "0") =>
         {
-            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some());
+            let again = widen(c, native, p, std::env::var_os("VICTORY_WAVE_WHY").is_some(), None, None);
             match again {
                 Ok(_) => again,
                 Err(_) => emit_program(c, native, p, st, io, res),
@@ -549,11 +560,14 @@ pub fn emit(
 /// it translates or a branch cannot be widened. Only where a thread group is one console
 /// wave: with several, the waves of a group would decide differently and a barrier inside
 /// such a branch would wait for threads that never come.
+/// `last`: given the structure the result was lowered with, where it is not stuck.
 fn widen(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
     why: bool,
+    last: Option<&mut Option<structure::Structured>>,
+    initial: Option<std::collections::HashSet<usize>>,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
     const NOT: ShaderError = ShaderError::Unsupported {
         offset: 0,
@@ -571,7 +585,7 @@ fn widen(
         }
         _ => return Err(NOT),
     }
-    let mut wide = std::collections::HashSet::new();
+    let mut wide = initial.unwrap_or_default();
     loop {
         let st = structure::structure_wide(p, &wide)?;
         let io = io::raise(p, native)?;
@@ -588,6 +602,9 @@ fn widen(
             if why {
                 eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
             }
+            if let Some(last) = last {
+                *last = Some(st);
+            }
             return r;
         }
         let more: Vec<usize> = lower::branches_around(&st, &needs)
@@ -603,6 +620,76 @@ fn widen(
         }
         wide.extend(more);
     }
+}
+
+/// The opt-in `VICTORY_LDS_PHASES=1` candidate: a console wave64 compute program of one console wave
+/// per thread group (64 threads) with LDS, on a host of 32-lane waves, translated with its LDS
+/// phases kept as the console orders them. The per-lane branches around its LDS accesses are
+/// taken wave-wide ([`widen`]), so both host waves run every iteration of every loop around
+/// them (lanes outside EXEC under their guards, with no effect), and the two waves meet at a
+/// group barrier before each LDS access: what one iteration's accesses did is seen by the
+/// next, in both halves, as within the console's one wave. Atomic returns stay as the program
+/// reads them.
+///
+/// Fails closed: refused unless the program has none of its own cross-lane code
+/// ([`lower::phase_class`]), the lowering under the strict contract
+/// ([`lower::with_strict_phases`]) breaches nothing, the result runs in waves of 32, and its
+/// loops pass [`lower::phase_loops`] on the structure it was lowered with.
+/// shortcut: lanes of one LDS atomic at one address are ordered as the host orders them,
+/// within a host wave and between the two (the console's order is its own).
+pub(super) fn try_lds_phases(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let refuse = |what| Err(ShaderError::Unsupported { offset: 0, what });
+    let crate::native::StageIo::Cs(cs) = native.io else {
+        return refuse("strict LDS phases outside a compute program");
+    };
+    if native.stage != HwStage::Cs
+        || !native.wave64
+        || lower::host_max_wave() != 32
+        || cs.threads.iter().try_fold(1u32, |n, &d| n.checked_mul(d)) != Some(64)
+        || cs.lds_bytes() == 0
+    {
+        return refuse("strict LDS phases outside one console wave64 group with LDS on 32-lane waves");
+    }
+    if group_sync() == 0 {
+        return refuse("strict LDS phases without group barriers that wait (VICTORY_GROUP_SYNC=0)");
+    }
+    let st = structure::structure(p)?;
+    if let Err(what) = lower::phase_class(p, &st) {
+        return refuse(what);
+    }
+    // The source wave has one program counter, including exits that bypass all LDS.
+    // Preserve every lane-dependent scalar decision across both host waves, not only
+    // branches surrounding a barrier. EXEC still guards the individual lane effects.
+    // `when` has already been simplified under the original path condition.
+    // Widening an outer branch can make an apparently constant nested test
+    // lane-dependent again. Seed every mask branch, including those constants.
+    let branches = st.wave_any.iter().enumerate()
+        .filter_map(|(b, kind)| kind.map(|_| b)).collect();
+    lower::take_needs();
+    let mut last = None;
+    let (r, breach, barriers) = lower::with_strict_phases(|| widen(c, native, p, false, Some(&mut last), Some(branches)));
+    lower::take_needs();
+    let r = r?;
+    if let Some(what) = breach {
+        return refuse(what);
+    }
+    if r.1 != Some(32) {
+        return refuse("strict LDS phases that still need 64-lane waves");
+    }
+    let Some(st) = last else {
+        return refuse("strict LDS phases without the structure they were lowered with");
+    };
+    // (the wave-wide structure too: no cross-lane code, one end)
+    for check in [lower::phase_class(p, &st), lower::phase_loops(p, &st, &barriers)] {
+        if let Err(what) = check {
+            return refuse(what);
+        }
+    }
+    Ok(r)
 }
 
 /// The translated program, and the wave size it requires of the host.

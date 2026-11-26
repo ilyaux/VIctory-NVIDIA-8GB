@@ -6,6 +6,10 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
+mod phases;
+use phases::{STRICT_BARRIERS, STRICT_FAULT, STRICT_PHASES, strict_breach};
+pub(super) use phases::{phase_class, phase_loops, with_strict_phases};
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::UserData;
@@ -89,6 +93,11 @@ enum Stop {
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
+        // (the strict phase audit speaks of the lowering that gives the result)
+        if STRICT_PHASES.get() {
+            STRICT_FAULT.set(None);
+            STRICT_BARRIERS.with_borrow_mut(Vec::clear);
+        }
         match Lower::new(parts, &bad).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
@@ -295,6 +304,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// Lane guards open now ([`Self::begin_guarded`]): a barrier inside one is not run by
+    /// every thread ([`with_strict_phases`]).
+    guard_depth: u32,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -949,6 +961,7 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1330,7 +1343,9 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
+                        // (strict phases: no meetings around lane branches, only a barrier
+                        // before every access, which the branches made wave-wide allow)
+                        if !lds_ok && !STRICT_PHASES.get() && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
                         }
@@ -1589,6 +1604,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            guard_depth: 0,
         }
     }
 
@@ -3717,6 +3733,7 @@ impl<'a> Lower<'a> {
 
     /// A group barrier with an LDS fence in `block`.
     fn group_sync(&mut self, block: usize) {
+        self.strict_barrier(block);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
@@ -4063,6 +4080,7 @@ impl<'a> Lower<'a> {
         self.s.m.terminate(self.cur, Term::CondBr(g, then, join));
         let head = self.cur;
         self.cur = then;
+        self.guard_depth += 1;
         Some((head, join))
     }
 
@@ -4074,6 +4092,7 @@ impl<'a> Lower<'a> {
         let then = self.cur;
         self.s.m.terminate(then, Term::Br(join));
         self.cur = join;
+        self.guard_depth = self.guard_depth.saturating_sub(1);
         values
             .iter()
             .map(|&(inside, outside)| {
@@ -4472,16 +4491,30 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
-        // shortcut: LDS addresses are taken as dword-aligned and in bounds
-        // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        // shortcut: LDS addresses are taken as naturally aligned. Bounds exclude the
+        // translation's exchange storage; guest out-of-bounds accesses must never name it.
+        let native_dwords = match self.x.native.io {
+            StageIo::Cs(cs) => cs.lds_bytes() / 4,
+            _ => self.s.lds_dwords,
+        };
+        let dword = |l: &mut Self, bytes: u32| -> (V, V) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let limit = l.s.m.i32(native_dwords);
+            let inside = l.s.m.cmp(c, pred::IULT, index, limit);
+            let zero = l.s.m.i32(0);
+            let index = l.s.m.select(c, inside, index, zero);
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), inside)
+        };
+        let on = |l: &mut Self, inside: V| -> V {
+            match guard {
+                Some(g) => l.s.m.bin(l.cur, Bin::And, g, inside),
+                None => inside,
+            }
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4515,7 +4548,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, inside) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -4525,6 +4558,8 @@ impl<'a> Lower<'a> {
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
                 let w = self.s.m.load(c, p);
+                let zero = self.s.m.i32(0);
+                let w = self.s.m.select(c, inside, w, zero);
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -4567,7 +4602,8 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -4586,8 +4622,10 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
+                    let (p, inside) = dword(self, off + 4 * k);
                     let x = self.s.m.load(self.cur, p);
+                    let zero = self.s.m.i32(0);
+                    let x = self.s.m.select(self.cur, inside, x, zero);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4609,12 +4647,13 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
-            let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, inside) = dword(self, off);
+                let g = on(self, inside);
+                let at = self.begin_guarded(Some(g));
                 self.s.m.store(self.cur, p, x);
+                self.end_guarded(at, &[]);
             }
-            self.end_guarded(at, &[]);
             return Ok(());
         }
         // Atomics: the old value returns with `_rtn`.
@@ -4647,13 +4686,19 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, inside) = dword(self, offset);
+        let zero = self.s.m.i32(0);
+        let outside = match guard {
+            Some(g) => self.s.m.select(self.cur, g, zero, outside),
+            None => zero,
+        };
+        let g = on(self, inside);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(Some(g));
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -4661,7 +4706,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(Some(g));
         let r = match rmw {
             Some(op) => self.s.m.atomic(self.cur, op, p, v0),
             // Compare with data0, store data1.
@@ -4793,20 +4838,26 @@ impl<'a> Lower<'a> {
                 && !(name.starts_with("ds_read")
                     || name.starts_with("ds_swizzle")
                     || name.contains("permute"));
-        if self.split_lds
-            && matches!(inst.fields, Fields::Ds { .. })
-            && !(name.starts_with("ds_swizzle") || name.contains("permute"))
-            && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b])
-        {
+        let lds_access = matches!(inst.fields, Fields::Ds { .. })
+            && !(name.starts_with("ds_swizzle") || name.contains("permute"));
+        if self.split_lds && lds_access && self.lds_meet.as_ref().is_none_or(|(all, _)| all[b]) {
             // the two host waves of a console wave meet before each LDS access: what the other
             // half wrote is visible, and what it still reads is not overwritten
+            self.strict_barrier(self.cur);
             let mode = self.s.m.i32(meeting_mode());
             let void = self.s.t.void;
             self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+        } else if lds_access && STRICT_PHASES.get() {
+            strict_breach("an LDS access without its phase barrier");
         }
         let r = match &inst.fields {
             Fields::Sop { .. } => self.sop(inst),
-            Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
+            Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => {
+                if STRICT_PHASES.get() {
+                    strict_breach("a title barrier left out");
+                }
+                Ok(())
+            }
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
                 // fence when the program writes UAVs (the waits before an
@@ -4821,6 +4872,11 @@ impl<'a> Lower<'a> {
                 };
                 if !waits {
                     mode &= !1;
+                    if STRICT_PHASES.get() {
+                        strict_breach("a title barrier kept as a fence alone");
+                    }
+                } else {
+                    self.strict_barrier(self.cur);
                 }
                 let mode = self.s.m.i32(mode);
                 let void = self.s.t.void;
@@ -4864,6 +4920,7 @@ impl<'a> Lower<'a> {
     /// The two host waves of a console wave meet (a group barrier with a shared-memory
     /// fence): LDS writes before are seen by reads after.
     fn lds_meeting(&mut self) {
+        self.strict_barrier(self.cur);
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
