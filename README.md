@@ -1,8 +1,8 @@
-# VIctory for RTX 5070 Laptop 8 GB
+# VIctory for NVIDIA 8 GB
 
 A personal development fork of
 [fxceless/victory-fork](https://github.com/fxceless/victory-fork), focused on
-NVIDIA RTX 5070 Laptop with 8 GB of VRAM and 32 GB of system RAM. The first
+AMD CPUs and NVIDIA RTX 50-series GPUs, tested with 8 GB of VRAM. The first
 priority is memory use and stability, followed by frame time in measured scenes.
 
 **No game files are included.** Supply your own copy and keep the game, caches,
@@ -14,15 +14,14 @@ Native runs have started on this machine. Startup/menu runs at approximately
 30 FPS; the first intro runs fell to roughly 0.3-3 FPS with pipelines still
 compiling. The initial baseline also ended with GPU device removal
 `0x887A0006`. Stable 30 FPS gameplay has not been established. See the
-[performance investigation](docs/performance-rtx5070.md) for evidence and limits.
+[performance investigation](docs/performance-nvidia-8gb.md) for evidence and limits.
 The automated GPU regressions below were run on WARP, the software adapter.
 
-| Target machine | Verified hardware |
+| Test platform | Public hardware summary |
 | --- | --- |
-| GPU | NVIDIA GeForce RTX 5070 Laptop GPU, 8 GB (8151 MiB reported) |
-| CPU | AMD Ryzen AI 7 350 |
-| System memory | 32 GB installed, approximately 31.1 GiB visible to Windows |
-| OS / NVIDIA driver | Windows 11 / 621.24 |
+| GPU | NVIDIA RTX 50-series |
+| CPU | AMD |
+| Video memory | 8 GB VRAM |
 
 This starts from `fxceless/victory-fork` at `9c184b3`, whose author reports
 testing on an RTX 4070. The inherited history and documentation are kept in
@@ -70,8 +69,8 @@ native tile test requires the D3D12 debug layer, which is not installed.
 Use Windows x64, the pinned Rust toolchain and MSVC build tools.
 
 ```powershell
-git clone https://github.com/ilyaux/VIctory-RTX5070-8GB.git
-cd VIctory-RTX5070-8GB
+git clone https://github.com/ilyaux/VIctory-NVIDIA-8GB.git
+cd VIctory-NVIDIA-8GB
 Copy-Item victory.example.toml victory.toml
 # Set your paths in victory.toml, outside this repository.
 cargo build --locked --profile diag -p victory --features diagnostics
@@ -79,7 +78,7 @@ cargo build --locked --profile diag -p victory --features diagnostics
 
 ## First hardware comparisons
 
-For each run, confirm that the logged D3D12 device is the RTX 5070.
+For each run, confirm that the logged D3D12 device is the intended NVIDIA GPU.
 Start with the existing adaptive memory budgeting; an explicit
 `VICTORY_TEXTURE_BUDGET_MB` limits texture-copy accounting and does not cap total
 VRAM use. No fixed 8 GB tuning preset has been established yet.

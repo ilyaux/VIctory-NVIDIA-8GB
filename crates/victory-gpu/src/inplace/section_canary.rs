@@ -48,8 +48,8 @@ fn section_buffer() -> Result<SectionBuffer, String> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
 
     let wanted = std::env::var("VICTORY_D3D12_ADAPTER").map_err(|_| "explicit adapter required")?;
-    if wanted != "NVIDIA GeForce RTX 5070 Laptop GPU" || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
-        return Err("explicit RTX 5070 Laptop hardware name with WARP disabled required".into());
+    if !wanted.starts_with("NVIDIA GeForce RTX 50") || std::env::var("VICTORY_WARP").is_ok_and(|v| v == "1") {
+        return Err("full NVIDIA RTX 50-series hardware name with WARP disabled required".into());
     }
     // This helper honors exact names and checks device/adapter LUID equality.
     // It creates a device only, without a runtime Host singleton or queues.
@@ -117,7 +117,7 @@ fn section_buffer() -> Result<SectionBuffer, String> {
 }
 
 #[test]
-#[ignore = "explicit RTX 5070 Laptop adapter required; device/heap/buffer, no submissions"]
+#[ignore = "explicit NVIDIA RTX 50-series adapter required; device/heap/buffer, no submissions"]
 fn named_nvidia_file_mapping_buffer_creation() -> Result<(), String> {
     section_buffer()?.finish()?;
     println!("Stage A accepted: cleanup complete, no application queues/lists/submissions");
@@ -125,7 +125,7 @@ fn named_nvidia_file_mapping_buffer_creation() -> Result<(), String> {
 }
 
 #[test]
-#[ignore = "explicit RTX 5070 Laptop; one owned 1-thread GPU dispatch; run alone in its own test process"]
+#[ignore = "explicit NVIDIA RTX 50-series adapter; one owned 1-thread GPU dispatch; run alone in its own test process"]
 fn named_nvidia_file_mapping_buffer_coherence() -> Result<(), String> {
     struct Resources {
         back: ID3D12Resource,

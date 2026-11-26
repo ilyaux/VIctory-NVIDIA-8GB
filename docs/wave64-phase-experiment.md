@@ -47,8 +47,8 @@ with original coauthor **Claude Opus 5.5**.
 - A previously rejected real compute container, supplied outside Git, produces
   WaveSize32 and passes Windows SDK DXIL validation. The public emitter selects
   the same audited result with the switch enabled. This is an offline check.
-- Manual synthetic checks on the explicitly selected **NVIDIA GeForce RTX 5070
-  Laptop GPU**, software=false, wave range32..32: **72 completed readbacks**.
+- Manual synthetic checks on the explicitly selected **NVIDIA RTX 50-series
+  hardware GPU**, software=false, wave range32..32: **72 completed readbacks**.
   They cover object-specific allocation across unequal loop lengths, native LDS
   bounds with added scratch, direct and forwarded collective exits, a repeated
   branch whose original condition looked constant, and raw VCC bits outside EXEC.
@@ -120,7 +120,7 @@ excluded explicitly. A second previously rejected external compute container
 now validates as WaveSize32 with21 retained waits, and the public emitter selects
 the same strict candidate. This is an offline compatibility result.
 
-On the named RTX5070 adapter,224 full-buffer synthetic readbacks pass:96 cover
+On the explicitly named NVIDIA adapter,224 full-buffer synthetic readbacks pass:96 cover
 allocation, native LDS bounds, collective exits, source memory waits and plain
 loop completion/collective loop-limit return;128 cover mask counts, first-set-bit,
 prefixes and atomic-return broadcast in64x1 and8x8 groups. The latter include an

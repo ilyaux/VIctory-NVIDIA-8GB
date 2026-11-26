@@ -1,11 +1,11 @@
-# RTX 5070 Laptop performance investigation
+# NVIDIA 8 GB performance investigation
 
-Target: stable 30 FPS in real gameplay on an RTX 5070 Laptop 8 GB,
-Ryzen AI 7 350 and 32 GB RAM. Menu FPS does not satisfy the target.
+Target: stable 30 FPS in real gameplay on an AMD CPU and an NVIDIA RTX
+50-series GPU with 8 GB VRAM. Menu FPS does not satisfy the target.
 
 ## 2026-11-26: first native baseline
 
-Build: `1e34f02`, Windows 11, driver 621.24, diagnostics profile, Series X.
+Build: `1e34f02`, diagnostics profile, Series X.
 Levels on demand enabled; mip reclamation disabled. A 100 Hz sampled profiler
 and the built-in frame logger were enabled. Test saves were copied from the
 user's data into an isolated directory. Game files, captures, caches and raw
@@ -95,7 +95,7 @@ this repo.
 
 ## Opt-in parallel hashing of card copies
 
-Branch `perf/rtx5070-card-hash` carries Martin Hartfelder's
+The parallel-hash experiment carries Martin Hartfelder's
 [64-thread card hash](https://github.com/fxceless/victory-fork/commit/55572246864888974da5bf8f418a092e73d66932),
 with the opt-in selection from fxceless's
 [6d20eed](https://github.com/fxceless/victory-fork/commit/6d20eed6ae8afe37c52f1911b46537b0ea8bcd0d).
@@ -119,7 +119,7 @@ each measured layer-work kind (20 control lines, 19 wide-hash lines):
 | Title GPU lists per usual frame | 73.0 ms | 57.1 ms |
 | Usual frame time | 175 ms | 152 ms |
 
-This supports reduced time in the layer's hash work on the RTX 5070. The scene
+This supports reduced time in the layer's hash work on the tested NVIDIA GPU. The scene
 progression and workloads differed, and the second run had warmer pipelines;
 the usual-frame logger excludes long frames. The table therefore does not
 establish an isolated full-frame speedup or sustained gameplay performance.
@@ -128,7 +128,7 @@ removal; both were deliberately stopped. The 30 FPS goal remains unmet.
 
 ## Host FidelityFX and the remaining picture defects
 
-Branch `perf/rtx5070-fidelityfx-host` selectively adapts the optional host
+The current development branch selectively adapts the optional host
 FidelityFX bridge from Marvis's
 [0b35b7f](https://github.com/Marvisak/VIctory/commit/0b35b7fe7d728c9a9c205cb3719a0f11744321ce),
 with original co-author Claude Fable 5.2. No SDK DLL is included. The bridge
@@ -136,7 +136,9 @@ requires `VICTORY_FIDELITYFX_DIR`, an explicitly selected hardware adapter and
 `VICTORY_FIDELITYFX_PROVIDER`. Unavailable or ambiguous selections fail closed.
 Without an SDK directory the original title DLL path remains in use.
 
-Use `VICTORY_D3D12_ADAPTER=NVIDIA GeForce RTX 5070 Laptop GPU` on this machine.
+Set `VICTORY_D3D12_ADAPTER` to the full name of the intended NVIDIA hardware
+adapter for each local run. Keep that machine-specific value in a private
+launch configuration outside the repository.
 A test executable does not inherit the game's Windows GPU preference: the
 first manual integration test selected the AMD integrated adapter, failed
 with zero output, and coincided with a user-reported display blackout and DWM
@@ -146,7 +148,7 @@ the asynchronous queue before readback and context destruction.
 
 With the official SDK 2.4.0 and provider `2.3.4`, the full flat-colour
 1280x720-to-1920x1080 integration test passed on WARP and the explicitly
-selected RTX 5070. All output RGB pixels were checked, over two dispatches.
+selected NVIDIA GPU. All output RGB pixels were checked, over two dispatches.
 Four bridge unit tests and the metadata-only adapter rejection test passed.
 The integration test is manual and ignored by default. Providers 3.1.5 and
 3.1.6 faulted inside WARP's compute compiler and were not retried on hardware.
@@ -218,8 +220,8 @@ author and co-author credits.
 The adapted compositor preserves the single-plane ahead path; multiple
 planes complete synchronously so their descriptor heaps can be reused
 safely. The console plane stride and field offsets passed a CPU-only test.
-Three manual tests passed first on explicit WARP and then on the exact RTX
-5070: spatial 2x2-to-8x8 scaling, three-plane premultiplied blending and
+Three manual tests passed first on explicit WARP and then on the explicitly
+selected NVIDIA GPU: spatial 2x2-to-8x8 scaling, three-plane premultiplied blending and
 order, repeated source state transitions, retained source identities and
 failure fallback followed by retry, and an unsampleable depth-only source
 that falls back before SRV creation and recovers with valid input. A CPU
