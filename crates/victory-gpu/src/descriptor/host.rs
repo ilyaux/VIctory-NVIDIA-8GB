@@ -1785,10 +1785,8 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
+        // Invalid title records must become null CBVs, not invalid device calls.
+        let desc = constant_desc(gpu, size).unwrap_or_default();
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -2396,6 +2394,21 @@ fn buffer_view_ok(format: DXGI_FORMAT, first: u64, count: u32, stride: u32, raw:
             .is_some_and(|end| end <= width)
 }
 
+/// The host's CBV size limit applies before rounding or allocating a title range.
+pub(crate) fn constant_size(size: u32) -> Option<u32> {
+    let max = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+    (size > 0 && size <= max).then(|| size.next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT))
+}
+
+fn constant_desc(gpu: u64, size: u32) -> Option<D3D12_CONSTANT_BUFFER_VIEW_DESC> {
+    let bytes = constant_size(size)?;
+    if gpu == 0 || !gpu.is_multiple_of(u64::from(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT)) {
+        return None;
+    }
+    gpu.checked_add(u64::from(bytes))?;
+    Some(D3D12_CONSTANT_BUFFER_VIEW_DESC { BufferLocation: gpu, SizeInBytes: bytes })
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -2716,18 +2729,19 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
-            let shadow = crate::shadow::find(address, u64::from(size))?;
-            let gpu = shadow.gpu(address);
-            if gpu % 256 != 0 {
-                once!(
-                    address = format_args!("{address:#x}"),
-                    "constant buffer not 256-byte aligned on the host"
-                );
+            // Validate the size before looking for or allocating its host copy.
+            if constant_size(size).is_none() {
+                once!(size, "constant buffer outside the host's size limit left null");
                 return None;
             }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+            let shadow = crate::shadow::find(address, u64::from(size))?;
+            let gpu = shadow.gpu(address);
+            let Some(desc) = constant_desc(gpu, size) else {
+                once!(
+                    address = format_args!("{address:#x}"),
+                    "constant buffer host address is not valid"
+                );
+                return None;
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3249,6 +3263,60 @@ mod tests {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    #[test]
+    fn constant_views_reject_invalid_ranges_before_rounding() {
+        let max = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+        for (size, bytes) in [(1, 256), (255, 256), (256, 256), (257, 512),
+            (max - 255, max), (max, max)] {
+            let desc = constant_desc(0x1000, size).unwrap();
+            assert_eq!(desc.BufferLocation, 0x1000);
+            assert_eq!(desc.SizeInBytes, bytes);
+        }
+        for size in [0, max + 1, max + 256, u32::MAX] {
+            assert!(constant_desc(0x1000, size).is_none());
+        }
+        assert!(constant_desc(0x1001, 256).is_none());
+        assert!(constant_desc(0, 256).is_none());
+        assert!(constant_desc(u64::MAX - 255, 256).is_none());
+        let null = constant_desc(0x1000, max + 256).unwrap_or_default();
+        assert_eq!((null.BufferLocation, null.SizeInBytes), (0, 0));
+    }
+
+    #[test]
+    #[cfg(feature = "diagnostics")]
+    #[ignore = "manual software-only descriptor check: VICTORY_CBV_WARP_TESTS=1 and VICTORY_D3D12_WARP=1"]
+    fn constant_views_manual_software_rejection_keeps_device_alive() {
+        assert_eq!(std::env::var("VICTORY_CBV_WARP_TESTS").as_deref(), Ok("1"));
+        assert_eq!(std::env::var("VICTORY_D3D12_WARP").as_deref(), Ok("1"));
+        assert!(std::env::var_os("VICTORY_D3D12_ADAPTER").is_none());
+        let host = host().expect("explicit software device, no silent skip");
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4, DXGI_ADAPTER_FLAG_SOFTWARE};
+        // SAFETY: inspect the adapter that owns the selected device before making views.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter1 = factory.EnumAdapterByLuid(host.device.GetAdapterLuid()).unwrap();
+            let desc = adapter.GetDesc1().unwrap();
+            assert_ne!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32, 0);
+            let end = desc.Description.iter().position(|&c| c == 0).unwrap_or(desc.Description.len());
+            eprintln!("CBV software-only test device: {}; no dispatch", String::from_utf16_lossy(&desc.Description[..end]));
+        }
+        let max = D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16;
+        let (buffer, _) = host.upload_buffer(u64::from(max)).unwrap();
+        // SAFETY: a live synthetic upload allocation.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let heap = HostHeap::new(false, 4).unwrap();
+        for size in [1, 257, max] { heap.constant_at(0, gpu, size); }
+        for size in [0, max + 1, max + 256, u32::MAX] {
+            heap.constant_at(1, gpu, size);
+            let invalid = View::Constant(u64::MAX - 255, size);
+            assert!(make(&invalid, heap.cpu(2)).is_none());
+            heap.make_at(2, &invalid);
+        }
+        // SAFETY: a query after valid/null descriptor creation; no command list was submitted.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        eprintln!("valid boundary and rejected/null CBVs: software device alive PASS");
     }
 
     /// The queue of textures picked by index serves the slots looked at

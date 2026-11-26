@@ -46,3 +46,23 @@ ordering is not established. Synthetic and offline checks do not establish
 correct gameplay, improved faces, stable frame rates, or game-level GPU safety.
 The separate experimental launcher must be identified by its executable hash
 and retained logs for the first real run.
+
+## First native trial
+
+The first native trial of this experiment reached 3D and created/bound the
+previously refused compute pipeline, then failed with device-removed reason
+`0x887A0001`. The experimental launcher is quarantined. The trial does not
+establish improved rendering or frame rate; this path remains off by default.
+
+The first error was noticed while heap descriptors were made, between GPU
+submissions. Its preceding batch includes an oversized constant-buffer view;
+the old creation path had no 64KiB size guard. This is a separate concrete
+validation defect, not proof of the exact failing call or its relationship to
+phase lowering. Runtime records remain outside Git.
+
+The follow-up CBV validation checks size, address alignment and overflow in
+both mirrored heaps and fresh tables; invalid entries become null CBVs before
+any title-range allocation or copy. CPU boundary checks pass. An explicit WARP
+test creates valid boundary views and rejected/null views with the device still
+alive; it submits no GPU commands. That check does not identify the native
+trial's exact offending API call.
